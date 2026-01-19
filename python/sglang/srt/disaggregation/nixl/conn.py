@@ -146,6 +146,11 @@ class NixlKVManager(CommonKVManager):
         self.agent = nixl_agent(str(uuid.uuid4()), nixl_agent_config(num_threads=8))
         self.register_buffer_to_engine()
 
+        self.perf_calc = 0
+        self.perf_desc = 0
+        self.perf_prep = 0
+        self.perf_xfer = 0
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -436,12 +441,6 @@ class NixlKVManager(CommonKVManager):
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
             self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
         )
-        # Create transfer descriptors
-        src_addrs = []
-        dst_addrs = []
-
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
 
         # Calculate precise byte offset and length for the sub-slice within the token
         src_head_slice_offset = src_head_start_offset * bytes_per_head_slice_to_send
@@ -462,60 +461,80 @@ class NixlKVManager(CommonKVManager):
             for layer_id in range(layers_current_pp_stage)
         ]
 
+        start_time = time.perf_counter()
+        prefill_indices = np.array(prefill_kv_indices, dtype=np.int64)
+        dst_indices = np.array(dst_kv_indices, dtype=np.int64)
+
+        num_layers = len(src_dst_ptr_pairs)
+        num_indices = len(prefill_indices)
+        total_descs = num_layers * num_indices * page_size
+
         src_addrs = []
         dst_addrs = []
 
-        # Calculate strides for a single token slot
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
+        bytes_per_token_prefill = src_kv_item_len // page_size
+        bytes_per_token_decode = dst_kv_item_len // page_size
+        token_offsets = np.arange(page_size, dtype=np.int64)
 
         for src_ptr, dst_ptr in src_dst_ptr_pairs:
-            for i in range(len(prefill_kv_indices)):
-                prefill_page_idx = int(prefill_kv_indices[i])
-                decode_page_idx = int(dst_kv_indices[i])
+            src_page_bases = src_ptr + prefill_indices * src_kv_item_len
+            dst_page_bases = dst_ptr + dst_indices * dst_kv_item_len
 
-                # Get the starting addresses for the current src and dst pages
-                src_page_start_addr = src_ptr + prefill_page_idx * src_kv_item_len
-                dst_page_start_addr = dst_ptr + decode_page_idx * dst_kv_item_len
+            src_all = (
+                src_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_prefill
+                + src_head_slice_offset
+            ).ravel()
 
-                # Iterate through each valid token slot within the current page
-                for token_slot_in_page in range(page_size):
-                    # Calculate the start address of the current token slot
-                    src_token_slot_start_addr = (
-                        src_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_prefill
-                    )
-                    dst_token_slot_start_addr = (
-                        dst_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_decode
-                    )
+            dst_all = (
+                dst_page_bases[:, None]
+                + token_offsets[None, :] * bytes_per_token_decode
+                + dst_head_slice_offset
+            ).ravel()
 
-                    # Calculate final src and dst addresses by applying head-slice offsets
-                    src_slice_addr = src_token_slot_start_addr + src_head_slice_offset
-                    dst_slice_addr = dst_token_slot_start_addr + dst_head_slice_offset
+            batch_size = len(src_all)
+            src_addrs.extend([
+                (int(src_all[i]), heads_bytes_per_token_to_send, self.kv_args.gpu_id)
+                for i in range(batch_size)
+            ])
+            dst_addrs.extend([
+                (int(dst_all[i]), heads_bytes_per_token_to_send, dst_gpu_id)
+                for i in range(batch_size)
+            ])
 
-                    src_addrs.append(
-                        (
-                            src_slice_addr,
-                            heads_bytes_per_token_to_send,
-                            self.kv_args.gpu_id,
-                        )
-                    )
-                    dst_addrs.append(
-                        (dst_slice_addr, heads_bytes_per_token_to_send, dst_gpu_id)
-                    )
+        end_time = time.perf_counter()
+        self.perf_calc += end_time - start_time
+        logger.error(f"calc time: {end_time - start_time}")
 
         # Use NIXL agent for transfer
+        start_time = time.perf_counter()
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
 
+        end_time = time.perf_counter()
+        self.perf_desc += end_time - start_time
+        logger.error(f"get_xfer_descs time: {end_time - start_time}, {len(src_addrs)}")
+
+        start_time = time.perf_counter()
         xfer_handle = self.agent.initialize_xfer(
             "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
         )
         if not xfer_handle:
             raise Exception("Failed to create sliced KV transfer")
 
+        end_time = time.perf_counter()
+        self.perf_prep += end_time - start_time
+        logger.error(f"initialize_xfer time: {end_time - start_time}")
+
+        start_time = time.perf_counter()
         state = self.agent.transfer(xfer_handle)
+
+        end_time = time.perf_counter()
+        self.perf_xfer += end_time - start_time
+        logger.error(f"transfer time: {end_time - start_time}")
+
+        logger.error(f"total times calc: {self.perf_calc}, descs: {self.perf_desc}, prep: {self.perf_prep}, xfer: {self.perf_xfer}")
+
         if state == "ERR":
             raise Exception("Failed to post sliced KV transfer")
 
