@@ -136,14 +136,14 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
-            from nixl._api import nixl_agent
+            from nixl._api import nixl_agent, nixl_agent_config
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
                 "https://github.com/ai-dynamo/nixl/blob/main/README.md "
                 "to run SGLang with NixlTransferEngine."
             ) from e
-        self.agent = nixl_agent(str(uuid.uuid4()))
+        self.agent = nixl_agent(str(uuid.uuid4()), nixl_agent_config(num_threads=8))
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
