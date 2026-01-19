@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import struct
+from itertools import repeat
 import threading
 import time
 import uuid
@@ -462,8 +463,8 @@ class NixlKVManager(CommonKVManager):
         ]
 
         start_time = time.perf_counter()
-        prefill_indices = np.array(prefill_kv_indices, dtype=np.int64)
-        dst_indices = np.array(dst_kv_indices, dtype=np.int64)
+        prefill_indices = np.asarray(prefill_kv_indices, dtype=np.int64)
+        dst_indices = np.asarray(dst_kv_indices, dtype=np.int64)
 
         num_layers = len(src_dst_ptr_pairs)
         num_indices = len(prefill_indices)
@@ -493,14 +494,20 @@ class NixlKVManager(CommonKVManager):
             ).ravel()
 
             batch_size = len(src_all)
-            src_addrs.extend([
-                (int(src_all[i]), heads_bytes_per_token_to_send, self.kv_args.gpu_id)
-                for i in range(batch_size)
-            ])
-            dst_addrs.extend([
-                (int(dst_all[i]), heads_bytes_per_token_to_send, dst_gpu_id)
-                for i in range(batch_size)
-            ])
+            src_addrs.extend(
+                zip(
+                    src_all.tolist(),
+                    repeat(heads_bytes_per_token_to_send),
+                    repeat(self.kv_args.gpu_id),
+                )
+            )
+            dst_addrs.extend(
+                zip(
+                    dst_all.tolist(),
+                    repeat(heads_bytes_per_token_to_send),
+                    repeat(dst_gpu_id),
+                )
+            )
 
         end_time = time.perf_counter()
         self.perf_calc += end_time - start_time
