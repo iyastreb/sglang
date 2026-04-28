@@ -201,6 +201,7 @@ class MooncakeKVManager(CommonKVManager):
         self.perf_calc = 0
         self.perf_stage = 0
         self.perf_xfer = 0
+        self.stage_count = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -587,7 +588,8 @@ class MooncakeKVManager(CommonKVManager):
         end_time = time.perf_counter()
         self.perf_xfer += end_time - start_time
         start_time = time.perf_counter()
-        logger.error(f"TOTAL: calc: {self.perf_calc * 1000000} us, stage: {self.perf_stage * 1000000} us, xfer: {self.perf_xfer * 1000000} us")
+        self.stage_count += 1
+        logger.error(f"TOTAL: calc: {self.perf_calc / self.stage_count * 1_000_000:.0f} us, stage: {self.perf_stage / self.stage_count * 1_000_000:.0f} us, xfer: {self.perf_xfer / self.stage_count * 1_000_000:.0f} us, stage_count: {self.stage_count}")
 
         return ret
 

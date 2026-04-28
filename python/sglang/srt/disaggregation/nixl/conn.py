@@ -221,6 +221,7 @@ class NixlKVManager(CommonKVManager):
         self.perf_stage = 0
         self.perf_prep = 0
         self.perf_xfer = 0
+        self.stage_count = 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.enable_staging:
@@ -929,7 +930,8 @@ class NixlKVManager(CommonKVManager):
         end_time = time.perf_counter()
         self.perf_xfer += end_time - start_time
         start_time = time.perf_counter()
-        logger.error(f"TOTAL: calc: {self.perf_calc * 1000000} us, stage: {self.perf_stage * 1000000} us, prep: {self.perf_prep * 1000000} us, xfer: {self.perf_xfer * 1000000} us")
+        self.stage_count += 1
+        logger.error(f"TOTAL: calc: {self.perf_calc / self.stage_count * 1_000_000:.0f} us, stage: {self.perf_stage / self.stage_count * 1_000_000:.0f} us, prep: {self.perf_prep / self.stage_count * 1_000_000:.0f} us, xfer: {self.perf_xfer / self.stage_count * 1_000_000:.0f} us, stage_count: {self.stage_count}")
         return xfer_handle
 
     def _get_staging_strategy(self, staging_buffer):
