@@ -198,6 +198,9 @@ class MooncakeKVManager(CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.perf_calc = 0
+        self.perf_stage = 0
+        self.perf_xfer = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -486,6 +489,8 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_item_len: int,
         staging_buffer=None,
     ) -> int:
+        start_time = time.perf_counter()
+
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
@@ -547,6 +552,10 @@ class MooncakeKVManager(CommonKVManager):
             gather_all_layers_to_staging,
         )
 
+        end_time = time.perf_counter()
+        self.perf_calc += end_time - start_time
+        start_time = time.perf_counter()
+
         gather_all_layers_to_staging(
             k_buffers,
             v_buffers,
@@ -557,6 +566,10 @@ class MooncakeKVManager(CommonKVManager):
             page_size,
             self.kv_args.gpu_id,
         )
+
+        end_time = time.perf_counter()
+        self.perf_stage += end_time - start_time
+        start_time = time.perf_counter()
 
         dst_write_ptr = dst_staging_ptr + rank_offset
         ret = self._transfer_data(
@@ -570,6 +583,12 @@ class MooncakeKVManager(CommonKVManager):
                 f"dst_ptr=0x{dst_write_ptr:x}, size={per_rank_bytes}. "
                 f"The decode staging buffer may not be properly registered."
             )
+
+        end_time = time.perf_counter()
+        self.perf_xfer += end_time - start_time
+        start_time = time.perf_counter()
+        logger.error(f"TOTAL: calc: {self.perf_calc * 1000000} us, stage: {self.perf_stage * 1000000} us, xfer: {self.perf_xfer * 1000000} us")
+
         return ret
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):

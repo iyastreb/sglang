@@ -217,6 +217,10 @@ class NixlKVManager(CommonKVManager):
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
+        self.perf_calc = 0
+        self.perf_stage = 0
+        self.perf_prep = 0
+        self.perf_xfer = 0
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.enable_staging:
@@ -809,6 +813,8 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         staging_buffer=None,
     ):
+        start_time = time.perf_counter()
+
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
@@ -866,6 +872,10 @@ class NixlKVManager(CommonKVManager):
             )
             return None
 
+        end_time = time.perf_counter()
+        self.perf_calc += end_time - start_time
+        start_time = time.perf_counter()
+
         # gather_all_layers_to_staging() runs the gather kernel on its own
         # dedicated stream and synchronizes that stream before returning, so
         # the staging buffer is fully populated and visible to the NIC by the
@@ -881,6 +891,10 @@ class NixlKVManager(CommonKVManager):
             page_size,
             self.kv_args.gpu_id,
         )
+
+        end_time = time.perf_counter()
+        self.perf_stage += end_time - start_time
+        start_time = time.perf_counter()
 
         dst_write_ptr = dst_staging_ptr + rank_offset
         src_reqs = np.array(
@@ -903,9 +917,19 @@ class NixlKVManager(CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
+
+        end_time = time.perf_counter()
+        self.perf_prep += end_time - start_time
+        start_time = time.perf_counter()
+
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
+
+        end_time = time.perf_counter()
+        self.perf_xfer += end_time - start_time
+        start_time = time.perf_counter()
+        logger.error(f"TOTAL: calc: {self.perf_calc * 1000000} us, stage: {self.perf_stage * 1000000} us, prep: {self.perf_prep * 1000000} us, xfer: {self.perf_xfer * 1000000} us")
         return xfer_handle
 
     def _get_staging_strategy(self, staging_buffer):
