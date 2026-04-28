@@ -201,8 +201,7 @@ class NixlKVManager(CommonKVManager):
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
         agent_config = nixl_agent_config(
-            backends=[backend],
-            num_threads=(8 if disaggregation_mode == DisaggregationMode.PREFILL else 0),
+            backends=[backend]
         )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
 
