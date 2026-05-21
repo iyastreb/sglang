@@ -276,6 +276,10 @@ class NixlKVManager(CommonKVManager):
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
+            self._xfer_completion_lock = threading.Lock()
+            self._room_pending_xfers: Dict[int, int] = defaultdict(int)
+            self._room_last_xfer_seen: Set[int] = set()
+            self._warned_missing_notify_xfer_done = False
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -560,6 +564,144 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
+    def _wait_xfer_handles(self, room: int, handles: List):
+        while handles:
+            states = [self.agent.check_xfer_state(h) for h in handles]
+            if any(s == "ERR" for s in states):
+                raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+            if all(s == "DONE" for s in states):
+                return
+            time.sleep(0)
+
+    def _validate_completed_xfers(self, room: int, handles: List):
+        states = [self.agent.check_xfer_state(h) for h in handles]
+        if any(s == "ERR" for s in states):
+            raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+        if not all(s == "DONE" for s in states):
+            raise RuntimeError(
+                f"NIXL notify_xfer_done fired before all handles completed "
+                f"room={room}, states={states}"
+            )
+
+    def _mark_xfer_chunk_failed(self, room: int):
+        with self._xfer_completion_lock:
+            pending = self._room_pending_xfers.get(room, 0)
+            if pending <= 1:
+                self._room_pending_xfers.pop(room, None)
+                self._room_last_xfer_seen.discard(room)
+            else:
+                self._room_pending_xfers[room] = pending - 1
+
+    def _mark_xfer_chunk_completed(
+        self, room: int, is_last: bool, counted: bool = True
+    ):
+        should_mark_success = False
+        with self._xfer_completion_lock:
+            if is_last:
+                self._room_last_xfer_seen.add(room)
+
+            if counted:
+                pending = self._room_pending_xfers.get(room, 0)
+                if pending <= 1:
+                    self._room_pending_xfers.pop(room, None)
+                else:
+                    self._room_pending_xfers[room] = pending - 1
+
+            if (
+                room in self._room_last_xfer_seen
+                and self._room_pending_xfers.get(room, 0) == 0
+            ):
+                self._room_last_xfer_seen.discard(room)
+                should_mark_success = True
+
+        if self.check_status(room) == KVPoll.Failed:
+            return
+
+        if should_mark_success:
+            self._complete_transfer_room(room)
+        else:
+            self.update_status(room, KVPoll.Transferring)
+
+    def _complete_transfer_room(self, room: int):
+        if self.check_status(room) == KVPoll.Failed:
+            return
+        self.update_status(room, KVPoll.Success)
+        # Drop per-room state on Success (parity with mooncake
+        # transfer_worker; staging prefetch sets are NIXL-only).
+        self.transfer_infos.pop(room, None)
+        self.req_to_decode_prefix_len.pop(room, None)
+        if self.enable_staging and self._staging_ctx is not None:
+            self._staging_ctx.prefetched_rooms.discard(room)
+            self._staging_ctx.prefetch_requested = {
+                k for k in self._staging_ctx.prefetch_requested if k[0] != room
+            }
+
+    def _record_transfer_exception(self, room: int, exc: Exception):
+        if isinstance(exc, _NIXL_TRANSPORT_ERRORS):
+            logger.warning(f"NIXL transport error for room {room}: {exc}")
+        else:
+            logger.exception(f"Unexpected transfer worker error for room {room}")
+        self.exceptions[room] = exc
+        self.record_failure(room, str(exc))
+        self.update_status(room, KVPoll.Failed)
+
+    def _register_xfer_completion(
+        self,
+        room: int,
+        handles: List,
+        is_last: bool,
+        block_until_done: bool = False,
+    ):
+        handles = [h for h in handles if h is not None]
+        if not handles:
+            self._mark_xfer_chunk_completed(room, is_last, counted=False)
+            return
+
+        with self._xfer_completion_lock:
+            self._room_pending_xfers[room] += 1
+            if is_last:
+                self._room_last_xfer_seen.add(room)
+
+        completion_event = threading.Event() if block_until_done else None
+
+        def on_done(*_args, **_kwargs):
+            try:
+                self._validate_completed_xfers(room, handles)
+                self._mark_xfer_chunk_completed(room, is_last)
+            except Exception as e:
+                self._mark_xfer_chunk_failed(room)
+                self._record_transfer_exception(room, e)
+            finally:
+                if completion_event is not None:
+                    completion_event.set()
+
+        notify_xfer_done = getattr(self.agent, "notify_xfer_done", None)
+        if notify_xfer_done is None:
+            if not self._warned_missing_notify_xfer_done:
+                logger.warning(
+                    "NIXL agent does not expose notify_xfer_done; falling back "
+                    "to polling transfer handles."
+                )
+                self._warned_missing_notify_xfer_done = True
+            try:
+                self._wait_xfer_handles(room, handles)
+                self._mark_xfer_chunk_completed(room, is_last)
+            except Exception:
+                self._mark_xfer_chunk_failed(room)
+                raise
+            return
+
+        try:
+            notify_xfer_done(handles, on_done)
+        except Exception as e:
+            self._mark_xfer_chunk_failed(room)
+            raise RuntimeError(
+                f"NIXL notify_xfer_done failed for room={room}"
+            ) from e
+
+        if completion_event is not None:
+            completion_event.wait()
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -588,6 +730,7 @@ class NixlKVManager(CommonKVManager):
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
                 handles: List = []
+                posted_staging_xfer = False
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -655,6 +798,8 @@ class NixlKVManager(CommonKVManager):
                             # send_kvcache_staged() returned None (e.g.
                             # decode buffer too small) -- fall through to
                             # the slice path below.
+                            if kv_xfer_handle is not None:
+                                posted_staging_xfer = True
 
                         if kv_xfer_handle is None:
                             notif = (
@@ -731,41 +876,16 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
-                while handles:
-                    states = [self.agent.check_xfer_state(h) for h in handles]
-                    if any(s == "ERR" for s in states):
-                        raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
-                    if all(s == "DONE" for s in states):
-                        break
-                    time.sleep(0)
-
-                if kv_chunk.is_last:
-                    self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
-                else:
-                    self.update_status(room, KVPoll.Transferring)
+                self._register_xfer_completion(
+                    room,
+                    handles,
+                    kv_chunk.is_last,
+                    block_until_done=posted_staging_xfer,
+                )
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
-                if isinstance(e, _NIXL_TRANSPORT_ERRORS):
-                    logger.warning(f"NIXL transport error for room {room}: {e}")
-                else:
-                    logger.exception(
-                        f"Unexpected transfer worker error for room {room}"
-                    )
-                self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
+                self._record_transfer_exception(room, e)
 
     def register_buffer_to_engine(self):
         kv_addrs = []
@@ -1237,8 +1357,8 @@ class NixlKVManager(CommonKVManager):
             retried on the next pop.
           - oversized chunk (will never fit) -> raise RuntimeError.
           - staging successfully posted -> return ``(handle, False)``. The
-            caller appends the handle to the per-chunk handle list and
-            busy-polls it to DONE alongside other handles.
+            caller appends the handle to the per-chunk handle list and waits
+            for completion before reusing its private staging buffer.
           - send_kvcache_staged returned None (decode buffer too small,
             kv_buffer_tensors missing, etc.) -> return ``(None, False)``,
             signalling the caller to fall back to send_kvcache_slice.
