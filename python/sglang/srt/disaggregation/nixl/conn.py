@@ -232,7 +232,7 @@ class NixlKVManager(CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
-        num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+        num_threads = 0
         backend_params = json.loads(
             envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
         )
