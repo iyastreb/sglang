@@ -298,12 +298,14 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            self._notif_lock = threading.Lock()
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
                 self._start_decode_staging_thread()
             self._start_heartbeat_checker_thread()
+            self._start_notif_thread()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -1609,8 +1611,22 @@ class NixlKVManager(CommonKVManager):
         )
         return None
 
+    def _start_notif_thread(self):
+        def loop():
+            while True:
+                try:
+                    self.update_transfer_status()
+                except Exception:
+                    logger.exception("NIXL notif drain thread error")
+                time.sleep(50e-6)
+
+        threading.Thread(target=loop, daemon=True, name="NixlNotifDrain").start()
+
     def update_transfer_status(self):
-        # Process notifications from received transfers.
+        with self._notif_lock:
+            self._update_transfer_status_locked()
+
+    def _update_transfer_status_locked(self):
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
             for msg in messages:
@@ -2009,7 +2025,8 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
 
-        self.kv_mgr.update_transfer_status()
+        # Notifs are drained continuously by NixlKVManager._start_notif_thread,
+        # so transfer_statuses is already up-to-date here.
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
