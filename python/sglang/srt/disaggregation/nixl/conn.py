@@ -730,7 +730,6 @@ class NixlKVManager(CommonKVManager):
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
                 handles: List = []
-                posted_staging_xfer = False
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -798,8 +797,6 @@ class NixlKVManager(CommonKVManager):
                             # send_kvcache_staged() returned None (e.g.
                             # decode buffer too small) -- fall through to
                             # the slice path below.
-                            if kv_xfer_handle is not None:
-                                posted_staging_xfer = True
 
                         if kv_xfer_handle is None:
                             notif = (
@@ -880,7 +877,7 @@ class NixlKVManager(CommonKVManager):
                     room,
                     handles,
                     kv_chunk.is_last,
-                    block_until_done=posted_staging_xfer,
+                    block_until_done=True,
                 )
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
