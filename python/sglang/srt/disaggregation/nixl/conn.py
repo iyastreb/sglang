@@ -298,7 +298,9 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
-            self._notif_lock = threading.Lock()
+            self._notif_lock = threading.RLock()
+            self._notif_cv = threading.Condition(self._notif_lock)
+            self._pending_notif_rooms: Set[int] = set()
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
@@ -542,14 +544,16 @@ class NixlKVManager(CommonKVManager):
 
         # Mark all pending transfers associated with the failed node as failed
         affected_rooms = []
-        for room in possible_affected_rooms:
-            if (
-                room in self.transfer_statuses
-                and not self.transfer_statuses[room].is_done()
-            ):
-                # Mark the transfer as failed
-                self.transfer_statuses[room].is_failure = True
-                affected_rooms.append(room)
+        with self._notif_lock:
+            for room in possible_affected_rooms:
+                if (
+                    room in self.transfer_statuses
+                    and not self.transfer_statuses[room].is_done()
+                ):
+                    # Mark the transfer as failed
+                    self.transfer_statuses[room].is_failure = True
+                    self._pending_notif_rooms.discard(room)
+                    affected_rooms.append(room)
 
         logger.error(
             f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
@@ -1614,19 +1618,25 @@ class NixlKVManager(CommonKVManager):
     def _start_notif_thread(self):
         def loop():
             while True:
+                with self._notif_cv:
+                    while not self._pending_notif_rooms:
+                        self._notif_cv.wait()
                 try:
-                    self.update_transfer_status()
+                    processed = self.update_transfer_status()
                 except Exception:
                     logger.exception("NIXL notif drain thread error")
-                time.sleep(50e-6)
+                    processed = 0
+                if processed == 0:
+                    time.sleep(50e-6)
 
         threading.Thread(target=loop, daemon=True, name="NixlNotifDrain").start()
 
     def update_transfer_status(self):
         with self._notif_lock:
-            self._update_transfer_status_locked()
+            return self._update_transfer_status_locked()
 
     def _update_transfer_status_locked(self):
+        processed = 0
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
             for msg in messages:
@@ -1656,6 +1666,21 @@ class NixlKVManager(CommonKVManager):
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                self._mark_transfer_status_done_locked(room)
+                processed += 1
+        return processed
+
+    def register_transfer_room(self, room: int, expects_state: bool = False):
+        with self._notif_cv:
+            status = self.transfer_statuses[room]
+            status.expects_state = status.expects_state or expects_state
+            self._pending_notif_rooms.add(room)
+            self._notif_cv.notify()
+
+    def _mark_transfer_status_done_locked(self, room: int):
+        status = self.transfer_statuses.get(room)
+        if status is not None and status.is_done():
+            self._pending_notif_rooms.discard(room)
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -1756,9 +1781,19 @@ class NixlKVManager(CommonKVManager):
             self._chunk_writer_counts.pop(room, None)
 
     def check_transfer_done(self, room: int):
-        if room not in self.transfer_statuses:
-            return False
-        return self.transfer_statuses[room].is_done()
+        with self._notif_lock:
+            if room not in self.transfer_statuses:
+                return False
+            return self.transfer_statuses[room].is_done()
+
+    def consume_transfer_status(self, room: int) -> Optional[TransferStatus]:
+        with self._notif_lock:
+            status = self.transfer_statuses.get(room)
+            if status is None or not status.is_done():
+                return None
+            self._pending_notif_rooms.discard(room)
+            del self.transfer_statuses[room]
+            return status
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
@@ -1961,6 +1996,14 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
+        # Mark that we expect state data if state_indices was provided.
+        # Match the prefill-side truthy check: an empty list means the
+        # model has no state types (e.g. dense LLaMA/Qwen), and prefill
+        # won't send state notifs, so we must not expect them.
+        self.kv_mgr.register_transfer_room(
+            self.bootstrap_room, expects_state=bool(state_indices)
+        )
+
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
@@ -1993,13 +2036,6 @@ class NixlKVReceiver(CommonKVReceiver):
                     ]
                 )
 
-        # Mark that we expect state data if state_indices was provided.
-        # Match the prefill-side truthy check: an empty list means the
-        # model has no state types (e.g. dense LLaMA/Qwen), and prefill
-        # won't send state notifs, so we must not expect them.
-        if state_indices:
-            self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
-
         self.started_transfer = True
         self.init_time = time.time()
 
@@ -2025,21 +2061,21 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
 
-        # Notifs are drained continuously by NixlKVManager._start_notif_thread,
-        # so transfer_statuses is already up-to-date here.
-        if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
+        # Notifs are drained by NixlKVManager._start_notif_thread while this
+        # room is active, so transfer_statuses is already up-to-date here.
+        transfer_status = self.kv_mgr.consume_transfer_status(self.bootstrap_room)
+        if transfer_status is not None:
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )
             # Check if the transfer failed
-            if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
+            if transfer_status.is_failed():
                 self.conclude_state = KVPoll.Failed
                 logger.error(
                     f"Transfer for room {self.bootstrap_room} failed due to node failure"
                 )
             else:
                 self.conclude_state = KVPoll.Success
-            del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
