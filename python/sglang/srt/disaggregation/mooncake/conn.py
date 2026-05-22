@@ -1947,6 +1947,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
+                _perf(
+                    "decode",
+                    self.kv_mgr.kv_args.engine_rank,
+                    (
+                        "receiver_poll_success"
+                        if status == KVPoll.Success
+                        else "receiver_poll_failed"
+                    ),
+                    room=self.bootstrap_room,
+                )
                 self.conclude_state = status
             elif status == KVPoll.WaitingForInput:
                 if self.init_time is not None:

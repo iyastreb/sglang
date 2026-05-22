@@ -2115,6 +2115,16 @@ class NixlKVReceiver(CommonKVReceiver):
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
+            _perf(
+                "decode",
+                self.kv_mgr.kv_args.engine_rank,
+                (
+                    "receiver_poll_success"
+                    if status == KVPoll.Success
+                    else "receiver_poll_failed"
+                ),
+                room=self.bootstrap_room,
+            )
             self.conclude_state = status
             return status
         if not self.started_transfer:
