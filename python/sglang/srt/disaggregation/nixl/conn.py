@@ -301,6 +301,7 @@ class NixlKVManager(CommonKVManager):
         self._prepared_kv_xfer_cache: Dict[str, PreparedKVXfer] = {}
         self._prepared_kv_xfer_failed_peers: Set[str] = set()
         self._prepared_kv_xfer_lock = threading.Lock()
+        self._wait_new_notifs_supported = hasattr(self.agent, "wait_new_notifs")
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
@@ -436,15 +437,19 @@ class NixlKVManager(CommonKVManager):
 
         def decode_progress_thread():
             while True:
+                wait_timeout_us = 1000 if self._wait_new_notifs_supported else None
                 try:
-                    touched_rooms = self.update_transfer_status()
+                    touched_rooms = self.update_transfer_status(wait_timeout_us)
                     if touched_rooms:
                         self._complete_ready_transfers(touched_rooms)
-                    else:
+                    elif wait_timeout_us is None:
                         time.sleep(0.0001)
                 except Exception:
                     logger.exception("NIXL decode progress thread failed")
                     time.sleep(1)
+
+        if self._wait_new_notifs_supported:
+            logger.info("Using blocking NIXL wait_new_notifs on decode progress thread")
 
         threading.Thread(target=decode_progress_thread, daemon=True).start()
 
@@ -2025,10 +2030,25 @@ class NixlKVManager(CommonKVManager):
         )
         return None
 
-    def update_transfer_status(self) -> Set[int]:
+    def _get_new_notifs(self, wait_timeout_us: Optional[int] = None):
+        if wait_timeout_us is None or not self._wait_new_notifs_supported:
+            return self.agent.get_new_notifs()
+        try:
+            return self.agent.wait_new_notifs(wait_timeout_us)
+        except Exception:
+            logger.warning(
+                "NIXL wait_new_notifs failed; falling back to get_new_notifs",
+                exc_info=True,
+            )
+            self._wait_new_notifs_supported = False
+            return self.agent.get_new_notifs()
+
+    def update_transfer_status(
+        self, wait_timeout_us: Optional[int] = None
+    ) -> Set[int]:
         # Process notifications from received transfers.
         touched_rooms: Set[int] = set()
-        notif_map = self.agent.get_new_notifs()
+        notif_map = self._get_new_notifs(wait_timeout_us)
         with self.transfer_status_lock:
             for peer_name, messages in notif_map.items():
                 for msg in messages:
