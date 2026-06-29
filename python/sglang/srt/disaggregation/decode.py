@@ -102,6 +102,23 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def _perf(rank: int, event: str, req: Optional[Req] = None, **kwargs):
+    room = kwargs.pop("room", None)
+    if room is None and req is not None:
+        room = req.bootstrap_room
+    if room is None:
+        return
+
+    parts = [f"room={room}"]
+    if req is not None:
+        parts.append(f"rid={req.rid}")
+    parts.extend(f"{key}={value}" for key, value in kwargs.items())
+    logger.error(
+        f"PERF t={time.time():.6f} side=decode_scheduler rank={rank} "
+        f"event={event} {' '.join(parts)}"
+    )
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -1541,6 +1558,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
+        _perf(
+            self.tp_rank,
+            "transfer_commit_start",
+            decode_req.req,
+            metadata_idx=idx,
+            cached_tokens=int(cached_tokens[0].item()),
+            output_id=int(output_id[0].item()),
+        )
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
@@ -1584,6 +1609,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        _perf(
+            self.tp_rank,
+            "transfer_commit_done",
+            decode_req.req,
+            metadata_idx=idx,
+            output_len=len(decode_req.req.output_ids),
+            cached_tokens=decode_req.req.cached_tokens,
+        )
         return
 
     def _poll_with_metadata_gate(self) -> List[int]:
@@ -1691,6 +1724,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+                _perf(
+                    self.tp_rank,
+                    "transfer_poll_success",
+                    decode_req.req,
+                    queue_idx=i,
+                    metadata_idx=decode_req.metadata_buffer_index,
+                )
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
@@ -1844,11 +1884,33 @@ class SchedulerDisaggregationDecodeMixin:
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
             assert self.chunked_req is None
+            for req in new_prebuilt_batch.reqs:
+                _perf(
+                    self.ps.tp_rank,
+                    "prebuilt_result_process_start",
+                    req,
+                    batch_size=len(new_prebuilt_batch.reqs),
+                )
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
+            for req in new_prebuilt_batch.reqs:
+                _perf(
+                    self.ps.tp_rank,
+                    "prebuilt_result_process_done",
+                    req,
+                    batch_size=len(new_prebuilt_batch.reqs),
+                    finished=req.finished(),
+                )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
+                for req in new_prebuilt_batch.reqs:
+                    _perf(
+                        self.ps.tp_rank,
+                        "running_batch_admit",
+                        req,
+                        batch_size=len(new_prebuilt_batch.reqs),
+                    )
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
@@ -1868,6 +1930,15 @@ class SchedulerDisaggregationDecodeMixin:
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
+            for req in ret.reqs:
+                if not getattr(req, "_pd_perf_first_decode_batch_scheduled", False):
+                    _perf(
+                        self.ps.tp_rank,
+                        "first_decode_batch_scheduled",
+                        req,
+                        batch_size=len(ret.reqs),
+                    )
+                    setattr(req, "_pd_perf_first_decode_batch_scheduled", True)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -1898,6 +1969,14 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                _perf(
+                    self.ps.tp_rank,
+                    "waiting_queue_selected",
+                    req,
+                    queue_idx=i,
+                    num_not_used_batch=num_not_used_batch,
+                    waiting_queue_len=len(self.waiting_queue),
+                )
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
@@ -1934,6 +2013,13 @@ class SchedulerDisaggregationDecodeMixin:
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
+        for req in can_run_list:
+            _perf(
+                self.ps.tp_rank,
+                "prebuilt_batch_ready",
+                req,
+                batch_size=len(can_run_list),
+            )
 
         return new_batch
 
@@ -1969,4 +2055,11 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
+            for req in transferred_reqs:
+                _perf(
+                    self.ps.tp_rank,
+                    "transfer_waiting_enqueue",
+                    req,
+                    waiting_queue_len=len(self.waiting_queue) + len(transferred_reqs),
+                )
             self.waiting_queue.extend(transferred_reqs)

@@ -53,6 +53,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _perf(side: str, rank: int, event: str, **kv):
+    parts = " ".join(f"{k}={v}" for k, v in kv.items())
+    logger.error(
+        f"PERF t={time.time():.6f} side={side} rank={rank} event={event} {parts}"
+    )
+
+
 GUARD = "NixlMsgGuard".encode("ascii")
 
 
@@ -705,6 +713,15 @@ class NixlKVManager(CommonKVManager):
         while True:
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
+            _perf(
+                "prefill",
+                self.kv_args.engine_rank,
+                "chunk_dequeued",
+                room=room,
+                chunk_id=kv_chunk.chunk_id,
+                is_last=int(kv_chunk.is_last_chunk),
+                pages=len(kv_chunk.prefill_kv_indices),
+            )
             handles: List[Any] = []
             try:
                 if self.check_status(room) == KVPoll.Failed:
@@ -862,6 +879,14 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                _perf(
+                    "prefill",
+                    self.kv_args.engine_rank,
+                    "rdma_posted",
+                    room=room,
+                    chunk_id=kv_chunk.chunk_id,
+                    num_handles=len(handles),
+                )
                 while handles:
                     states = [self.agent.check_xfer_state(h) for h in handles]
                     if any(s == "ERR" for s in states):
@@ -869,9 +894,23 @@ class NixlKVManager(CommonKVManager):
                     if all(s == "DONE" for s in states):
                         break
                     time.sleep(0)
+                _perf(
+                    "prefill",
+                    self.kv_args.engine_rank,
+                    "rdma_done",
+                    room=room,
+                    chunk_id=kv_chunk.chunk_id,
+                    is_last=int(kv_chunk.is_last_chunk),
+                )
 
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
+                    _perf(
+                        "prefill",
+                        self.kv_args.engine_rank,
+                        "room_success",
+                        room=room,
+                    )
                     # Drop per-room state on Success (parity with mooncake
                     # transfer_worker; staging prefetch sets are NIXL-only).
                     self.transfer_infos.pop(room, None)
@@ -1707,6 +1746,15 @@ class NixlKVManager(CommonKVManager):
                     chunk_id = int(components[2])
                     is_last_chunk = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
+                    _perf(
+                        "decode",
+                        self.kv_args.engine_rank,
+                        "notif_kv",
+                        room=room,
+                        chunk_id=chunk_id,
+                        is_last=int(is_last_chunk),
+                        peer=peer_name,
+                    )
                     self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
                 elif tag == "stg":
                     self._handle_stg_notification(components, room)
@@ -1744,6 +1792,12 @@ class NixlKVManager(CommonKVManager):
                        (decode-side radix cache hit; this pp_rank sent
                        no KV pages, so expected_kvs_per_pp[pp_rank] = 0)
         """
+        _perf(
+            "decode",
+            self.kv_args.engine_rank,
+            "notif_aux",
+            room=room,
+        )
         self.transfer_statuses[room].received_aux = True
         # main's "nokv" marker (decode-side radix cache hit, see #19746).
         if len(components) > 3 and components[2] == "nokv":
@@ -1876,6 +1930,13 @@ class NixlKVManager(CommonKVManager):
                 ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
+                    _perf(
+                        "prefill",
+                        self.kv_args.engine_rank,
+                        "request_received",
+                        room=room,
+                        n_peers=required_dst_info_num,
+                    )
                     self.req_to_decode_prefix_len[room] = next(
                         (
                             info.decode_prefix_len
@@ -2064,12 +2125,29 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.started_transfer = True
         self.init_time = time.time()
+        _perf(
+            "decode",
+            self.kv_mgr.kv_args.engine_rank,
+            "request_sent",
+            room=self.bootstrap_room,
+            aux_index=aux_index,
+        )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
+            _perf(
+                "decode",
+                self.kv_mgr.kv_args.engine_rank,
+                (
+                    "receiver_poll_success"
+                    if status == KVPoll.Success
+                    else "receiver_poll_failed"
+                ),
+                room=self.bootstrap_room,
+            )
             self.conclude_state = status
             return status
         if not self.started_transfer:
@@ -2085,6 +2163,12 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room
             )
             self.conclude_state = KVPoll.Success
+            _perf(
+                "decode",
+                self.kv_mgr.kv_args.engine_rank,
+                "room_done",
+                room=self.bootstrap_room,
+            )
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore

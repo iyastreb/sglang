@@ -57,6 +57,14 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+
+def _perf(side: str, rank: int, event: str, **kv):
+    parts = " ".join(f"{k}={v}" for k, v in kv.items())
+    logger.error(
+        f"PERF t={time.time():.6f} side={side} rank={rank} event={event} {parts}"
+    )
+
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
@@ -1173,6 +1181,15 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                _perf(
+                    "prefill",
+                    self.kv_args.engine_rank,
+                    "chunk_dequeued",
+                    room=kv_chunk.room,
+                    chunk_id=getattr(kv_chunk, "chunk_id", -1),
+                    is_last=int(kv_chunk.is_last_chunk),
+                    pages=len(kv_chunk.prefill_kv_indices),
+                )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1345,7 +1362,22 @@ class MooncakeKVManager(CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
+                                if status == KVPoll.Success:
+                                    _perf(
+                                        "prefill",
+                                        self.kv_args.engine_rank,
+                                        "room_success",
+                                        room=req.room,
+                                    )
                                 for endpoint, dst_port, room in dst_ranks_infos:
+                                    _perf(
+                                        "prefill",
+                                        self.kv_args.engine_rank,
+                                        "notif_sent",
+                                        room=room,
+                                        peer=f"{endpoint}:{dst_port}",
+                                        status=int(status),
+                                    )
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
                                         dst_port,
@@ -1375,6 +1407,15 @@ class MooncakeKVManager(CommonKVManager):
 
                 if staging_deferred:
                     continue
+
+                _perf(
+                    "prefill",
+                    self.kv_args.engine_rank,
+                    "rdma_done",
+                    room=kv_chunk.room,
+                    chunk_id=getattr(kv_chunk, "chunk_id", -1),
+                    is_last=int(kv_chunk.is_last_chunk),
+                )
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -1476,6 +1517,13 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
+                        _perf(
+                            "prefill",
+                            self.kv_args.engine_rank,
+                            "request_received",
+                            room=room,
+                            n_peers=required_dst_info_num,
+                        )
                         self.req_to_decode_prefix_len[room] = next(
                             (
                                 info.decode_prefix_len
@@ -1534,6 +1582,15 @@ class MooncakeKVManager(CommonKVManager):
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
 
+                _perf(
+                    "decode",
+                    self.kv_args.engine_rank,
+                    "notif_received",
+                    room=bootstrap_room,
+                    prefill_rank=prefill_rank,
+                    status=status,
+                )
+
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
@@ -1550,6 +1607,12 @@ class MooncakeKVManager(CommonKVManager):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
+                            _perf(
+                                "decode",
+                                self.kv_args.engine_rank,
+                                "room_done",
+                                room=bootstrap_room,
+                            )
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
@@ -1870,6 +1933,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     ]
                 )
         self.init_time = time.time()
+        _perf(
+            "decode",
+            self.kv_mgr.kv_args.engine_rank,
+            "request_sent",
+            room=self.bootstrap_room,
+            aux_index=aux_index,
+        )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -1877,6 +1947,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
+            _perf(
+                "decode",
+                self.kv_mgr.kv_args.engine_rank,
+                (
+                    "receiver_poll_success"
+                    if status == KVPoll.Success
+                    else "receiver_poll_failed"
+                ),
+                room=self.bootstrap_room,
+            )
             self.conclude_state = status
         elif status == KVPoll.WaitingForInput:
             timeout_result = self._check_waiting_timeout()
