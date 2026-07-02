@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import select
 import struct
 import threading
 import time
@@ -255,7 +256,7 @@ class NixlKVManager(CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
-        num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+        num_threads = 0 #8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
         backend_params = json.loads(
             envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
         )
@@ -862,13 +863,13 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
-                while handles:
-                    states = [self.agent.check_xfer_state(h) for h in handles]
-                    if any(s == "ERR" for s in states):
-                        raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
-                    if all(s == "DONE" for s in states):
-                        break
-                    time.sleep(0)
+                if handles:
+                    for h in handles:
+                        select.select([self.agent.get_xfer_event_fd(h)], [], [])
+                        if self.agent.check_xfer_state(h) == "ERR":
+                            raise RuntimeError(
+                                f"NIXL transfer encountered ERR room={room}"
+                            )
 
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
