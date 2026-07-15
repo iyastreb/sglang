@@ -345,6 +345,8 @@ class TransferStatus:
 
 
 class NixlKVManager(CommonKVManager):
+    _nixl_wait_api_available = False
+
     def __init__(
         self,
         args: KVArgs,
@@ -409,7 +411,14 @@ class NixlKVManager(CommonKVManager):
                 f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
                 f"Please install the required NIXL plugin or choose from: {available_plugins}"
             )
-        logger.info(f"NIXL KVManager initialized with backend: {backend}")
+        self._nixl_wait_api_available = callable(
+            getattr(self.agent, "wait_xfer_all", None)
+        )
+        logger.info(
+            "NIXL KVManager initialized with backend: %s; wait API: %s",
+            backend,
+            "available" if self._nixl_wait_api_available else "unavailable",
+        )
 
         self.register_buffer_to_engine()
 
@@ -1000,6 +1009,40 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
+    def _post_xfer(self, xfer_handle: Any) -> str:
+        if self._nixl_wait_api_available:
+            return self.agent.transfer(xfer_handle, async_completion=True)
+        return self.agent.transfer(xfer_handle)
+
+    def _wait_xfers(self, handles: List[Any], room: int) -> None:
+        if not handles:
+            return
+
+        if self._nixl_wait_api_available:
+            self.agent.wait_xfer_all(handles)
+            for handle in handles:
+                state = self.agent.check_xfer_state(handle)
+                if state == "ERR":
+                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+                if state != "DONE":
+                    raise RuntimeError(
+                        "NIXL wait API returned before transfer completion "
+                        f"room={room}, state={state}"
+                    )
+            return
+
+        while True:
+            all_done = True
+            for handle in handles:
+                state = self.agent.check_xfer_state(handle)
+                if state == "ERR":
+                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+                if state != "DONE":
+                    all_done = False
+            if all_done:
+                return
+            time.sleep(0)
+
     def transfer_worker(self, queue: FastQueue, staging_buffer=None):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
@@ -1187,19 +1230,7 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
-                while handles:
-                    all_done = True
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
+                self._wait_xfers(handles, room)
 
                 if kv_chunk.is_last_chunk:
                     self.update_status(room, KVPoll.Success)
@@ -1351,7 +1382,7 @@ class NixlKVManager(CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_xfer(xfer_handle)
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
@@ -1461,7 +1492,7 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -1524,7 +1555,7 @@ class NixlKVManager(CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
-            state = self.agent.transfer(xfer_handle)
+            state = self._post_xfer(xfer_handle)
             if state == "ERR":
                 raise Exception("KVSender failed to post mixed prepped transfer")
             handles.append(xfer_handle)
@@ -1571,7 +1602,7 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create prepped slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post prepped slice transfer")
         return xfer_handle
@@ -1683,7 +1714,7 @@ class NixlKVManager(CommonKVManager):
                 f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
                 f"size={per_rank_bytes})"
             )
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle)
         if state == "ERR":
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
@@ -1723,8 +1754,8 @@ class NixlKVManager(CommonKVManager):
             retried on the next pop.
           - oversized chunk (will never fit) -> raise RuntimeError.
           - staging successfully posted -> return ``(handle, False)``. The
-            caller appends the handle to the per-chunk handle list and
-            busy-polls it to DONE alongside other handles.
+            caller appends the handle to the per-chunk handle list and waits
+            for it to reach DONE alongside other handles.
           - send_kvcache_staged returned None (decode buffer too small,
             kv_buffer_tensors missing, etc.) -> return ``(None, False)``,
             signalling the caller to fall back to send_kvcache_slice.
@@ -1802,7 +1833,7 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -1848,7 +1879,7 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle)
         if state == "ERR":
             raise Exception("Failed to post Mamba state transfer")
         return xfer_handle
@@ -1951,7 +1982,7 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("Failed to create Mamba state slice transfer")
-        state = self.agent.transfer(xfer_handle)
+        state = self._post_xfer(xfer_handle)
         if state == "ERR":
             raise Exception("Failed to post Mamba state slice transfer")
         return xfer_handle
