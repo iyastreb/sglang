@@ -5,6 +5,8 @@ import gc
 import inspect
 import json
 import os
+import pathlib
+import resource
 import socket
 import time
 
@@ -22,7 +24,9 @@ def cpu_location():
             khz = int(f.read())
     except OSError:
         khz = None
-    return dict(core=core, khz=khz)
+    base = pathlib.Path(f"/sys/devices/system/cpu/cpu{core}")
+    nodes = [p.name for p in base.glob("node*")]
+    return dict(core=core, khz=khz, nodes=nodes)
 
 
 def tokenizer_profile(fn):
@@ -30,7 +34,16 @@ def tokenizer_profile(fn):
         return fn
     @functools.wraps(fn)
     async def wrapped(*args, **kwargs):
+        affinity = os.sched_getaffinity(0)
+        control = pathlib.Path(os.environ["LOG_DIR"]) / "tokenizer-core"
+        selected = control.read_text().strip() if control.exists() else "auto"
+        if os.getenv("FLUCT_ROLE") == "prefill" and selected != "auto":
+            core = int(selected)
+            if core not in affinity:
+                raise RuntimeError(f"CPU {core} outside allowed affinity {sorted(affinity)}")
+            os.sched_setaffinity(0, {core})
         before = cpu_location()
+        usage = resource.getrusage(resource.RUSAGE_THREAD)
         profiler = cProfile.Profile()
         profiler.enable()
         try:
@@ -38,9 +51,14 @@ def tokenizer_profile(fn):
         finally:
             profiler.disable()
             after = cpu_location()
+            final_usage = resource.getrusage(resource.RUSAGE_THREAD)
+            os.sched_setaffinity(0, affinity)
             hot = sorted(profiler.getstats(), key=lambda e: e.inlinetime, reverse=True)[:12]
             emit("tokenizer_cpu", before=before, after=after,
                  parallelism=os.getenv("TOKENIZERS_PARALLELISM"),
+                 requested_core=selected, allowed_cores=sorted(affinity),
+                 usage={key: getattr(final_usage, key) - getattr(usage, key)
+                        for key in ("ru_minflt", "ru_majflt", "ru_nvcsw", "ru_nivcsw")},
                  functions=[dict(name=e.code if isinstance(e.code, str) else
                                  f"{e.code.co_filename}:{e.code.co_name}",
                                  self_ms=e.inlinetime*1000, total_ms=e.totaltime*1000,
