@@ -13,6 +13,7 @@
 # ==============================================================================
 """DetokenizerManager is a process that detokenizes the token ids."""
 
+from sglang.srt.observability.fluct_profile import span as fluct_span
 import dataclasses
 import logging
 import os
@@ -300,6 +301,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             results[i] = text
         return results
 
+    @fluct_span
     def _decode_batch_token_id_output(self, recv_obj: BatchTokenIDOutput):
         bs = len(recv_obj.rids)
         vocab_size = self.vocab_size
@@ -440,6 +442,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for item in data_list
         ]
 
+    @fluct_span
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # Beam decoding is additive: a batch may mix beam leaders with normal
         # requests, so every item still goes through the standard decode.

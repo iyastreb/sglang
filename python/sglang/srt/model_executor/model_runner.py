@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from sglang.srt.observability.fluct_profile import span as fluct_span
 import contextlib
 import inspect
 import logging
@@ -1705,6 +1706,7 @@ class ModelRunner:
         forward_batch.split_index = next_split_index
         return ret
 
+    @fluct_span
     def forward(
         self,
         forward_batch: ForwardBatch,

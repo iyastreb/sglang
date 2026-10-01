@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.observability.fluct_profile import span as fluct_span
 import atexit
 import logging
 import threading
@@ -549,6 +550,7 @@ class UnifiedRadixCache(BasePrefixCache):
         same_params=["params"],
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
+    @fluct_span
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:

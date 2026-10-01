@@ -687,6 +687,8 @@ async def async_request_sglang_generate(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
+    from sglang.srt.observability.fluct_profile import emit as profile_emit
+
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
 
@@ -727,6 +729,7 @@ async def async_request_sglang_generate(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
+        profile_emit("client_start", isl=request_func_input.prompt_len)
         output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
@@ -734,6 +737,7 @@ async def async_request_sglang_generate(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                profile_emit("client_headers", elapsed_ms=(time.perf_counter()-st)*1000)
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -754,6 +758,7 @@ async def async_request_sglang_generate(
                             data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
+                            profile_emit("client_chunk", elapsed_ms=(time.perf_counter()-st)*1000, bytes=len(chunk_bytes), meta=_meta_info)
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"

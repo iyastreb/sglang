@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.observability.fluct_profile import span as fluct_span
 import logging
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -255,6 +256,7 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         output.consume(batch, cls._build_auxiliary_commits(batch, output_starts))
 
+    @fluct_span
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -919,6 +921,7 @@ class SchedulerBatchResultProcessor:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+    @fluct_span
     def process_batch_result_decode(
         self,
         batch: ScheduleBatch,

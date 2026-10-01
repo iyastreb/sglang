@@ -1,5 +1,7 @@
 """SGLang public API."""
 
+from sglang.srt.observability import fluct_profile as _fluct_profile
+
 import platform as _platform
 import sys as _sys
 

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from sglang.srt.observability.fluct_profile import span as fluct_span
 import asyncio
 import copy
 import dataclasses
@@ -1053,6 +1054,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids, token_type_ids, input_format, original_batch_size
         )
 
+    @fluct_span
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1683,6 +1685,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    @fluct_span
     async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
@@ -2366,6 +2369,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
+    @fluct_span
     async def _handle_batch_output(
         self,
         recv_obj: Union[

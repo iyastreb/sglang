@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.observability.fluct_profile import span as fluct_span
 import threading
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -379,6 +380,7 @@ class _SharedPageEnvelopeHostBacking:
         finally:
             self.release_layout()
 
+    @fluct_span
     def _compact_side(self, side: _Side) -> None:
         reverse = side.grow_direction == "down"
         live = sorted(side.physical_to_logical.items(), reverse=reverse)
@@ -406,6 +408,7 @@ class _SharedPageEnvelopeHostBacking:
             len(live) if side.grow_direction == "up" else side.page_num - 1 - len(live)
         )
 
+    @fluct_span
     def _compact(self) -> None:
         events = self._begin_compaction()
         try:

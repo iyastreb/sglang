@@ -22,6 +22,7 @@ page math collapses to slot math byte-identically.
 
 from __future__ import annotations
 
+from sglang.srt.observability.fluct_profile import span as fluct_span
 import inspect
 import logging
 import os
@@ -1130,6 +1131,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- alloc --
 
+    @fluct_span
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         """Allocate `need_size` virtual TOKEN ids (id-owner only). Returns
         token-granular, page-structured ids, or None on shortfall.
@@ -1186,6 +1188,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- paged alloc surface --
 
+    @fluct_span
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -1257,6 +1260,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual token ids
 
+    @fluct_span
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
@@ -1425,6 +1429,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._release_phys_pages_batch"):
             self._free_phys_pages = torch.cat([self._free_phys_pages, pages])
 
+    @fluct_span
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
         """Eager compaction: move survivors out of the vacated band into the holes
         in the kept band. `src`/`dst` are disjoint by construction, so the batched
@@ -1434,6 +1439,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._compact_pending"):
             self._compact_pending_impl(freed_physical_pages)
 
+    @fluct_span
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
         assert self.disagg_move_gate is None and self.host_transfer_move_gate is None, (
             f"_compact_pending({self.sub_pool_name!r}): eager compaction ran "
@@ -2559,6 +2565,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 return 0
             return self._flush(urgent=False)
 
+    @fluct_span
     def compact_holes(self, *, retreat_side: str) -> int:
         """Close ALL interior holes by packing live pages toward the side
         OPPOSITE ``retreat_side`` (order-preserving), shrinking the span on

@@ -227,6 +227,7 @@ class RequestStage:
 
 @dataclass
 class ReqTimeStatsBase:
+    profile_rid: str = ""
     enable_metrics: bool = False
     metrics_collector: Optional[
         Union[
@@ -290,6 +291,7 @@ class ReqTimeStatsBase:
         bootstrap_room: Optional[int],
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
+        self.profile_rid = rid
         if is_async_tracing_available():
             self.trace_ctx = TraceReqContextAsync(
                 rid=rid,
@@ -339,6 +341,7 @@ class ReqTimeStatsBase:
             "disagg_mode": self.disagg_mode.value if self.disagg_mode else None,
             "enable_metrics": False,
             "trace_ctx": trace_ctx_state,
+            "profile_rid": self.profile_rid,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
 
@@ -1286,3 +1289,9 @@ def flush_trace_batch(reqs: List[Any]):
             trace_ctx = getattr(time_stats, "trace_ctx", None)
             if trace_ctx is not None:
                 trace_ctx.flush()
+
+
+from sglang.srt.observability.fluct_profile import stages as _fluct_stages
+
+_fluct_stages(APIServerReqTimeStats)
+_fluct_stages(SchedulerReqTimeStats)
