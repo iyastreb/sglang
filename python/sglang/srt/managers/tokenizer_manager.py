@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from sglang.srt.observability.fluct_profile import span as fluct_span
+from sglang.srt.observability.fluct_profile import tokenizer_profile
 import asyncio
 import copy
 import dataclasses
@@ -982,6 +983,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # For true batches, return as-is
         return input_ids, token_type_ids
 
+    @tokenizer_profile
     async def _tokenize_texts(
         self, texts: Union[str, List[str]], is_cross_encoder: bool = False
     ) -> Union[
@@ -3686,7 +3688,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
-            time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+            time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode, profile_rid=rid)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
             if self.enable_trace:

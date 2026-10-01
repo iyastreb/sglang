@@ -1,4 +1,6 @@
 import functools
+import cProfile
+import ctypes
 import gc
 import inspect
 import json
@@ -10,6 +12,40 @@ ENABLED = os.getenv("SGLANG_FLUCT_PROFILE") == "1"
 _pid = None
 _fd = None
 _gc_starts = {}
+_libc = ctypes.CDLL(None)
+
+
+def cpu_location():
+    core = _libc.sched_getcpu()
+    try:
+        with open(f"/sys/devices/system/cpu/cpu{core}/cpufreq/scaling_cur_freq") as f:
+            khz = int(f.read())
+    except OSError:
+        khz = None
+    return dict(core=core, khz=khz)
+
+
+def tokenizer_profile(fn):
+    if not ENABLED:
+        return fn
+    @functools.wraps(fn)
+    async def wrapped(*args, **kwargs):
+        before = cpu_location()
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            profiler.disable()
+            after = cpu_location()
+            hot = sorted(profiler.getstats(), key=lambda e: e.inlinetime, reverse=True)[:12]
+            emit("tokenizer_cpu", before=before, after=after,
+                 parallelism=os.getenv("TOKENIZERS_PARALLELISM"),
+                 functions=[dict(name=e.code if isinstance(e.code, str) else
+                                 f"{e.code.co_filename}:{e.code.co_name}",
+                                 self_ms=e.inlinetime*1000, total_ms=e.totaltime*1000,
+                                 calls=e.callcount) for e in hot])
+    return wrapped
 
 
 def emit(event, **fields):

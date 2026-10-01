@@ -693,6 +693,14 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        if os.getenv("SGLANG_FLUCT_TOKEN_IDS") == "1":
+            async with session.post(
+                f"http://{os.environ['PREFILL_NODE']}:30000/tokenize",
+                json={"prompt": prompt, "add_special_tokens": True},
+            ) as encoded:
+                encoded.raise_for_status()
+                prompt = (await encoded.json())["tokens"]
+            profile_emit("pretokenized", token_count=len(prompt))
         sampling_params = {
             "temperature": args.temperature,
             "max_new_tokens": request_func_input.output_len,
