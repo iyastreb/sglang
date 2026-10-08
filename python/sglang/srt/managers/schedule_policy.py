@@ -4,6 +4,7 @@ import logging
 from array import array
 
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -1453,12 +1455,21 @@ class PrefillAdder:
                     ):
                         return AddReqResult.NO_TOKEN
                     promised_host_hit = req.host_hit_length
+                    load_back_start = time.perf_counter()
                     loaded = self.tree_cache.init_load_back(
                         InitLoadBackParams(
                             best_match_node=req.best_match_node,
                             host_hit_length=req.host_hit_length,
                             req=req,
                         )
+                    )
+                    perf_trace.emit(
+                        "pf.load_back",
+                        rid=req.rid,
+                        room=req.bootstrap_room,
+                        host_hit=req.host_hit_length,
+                        loaded=len(loaded[0]) if loaded is not None else -1,
+                        ms=(time.perf_counter() - load_back_start) * 1e3,
                     )
                 if loaded is None:
                     return AddReqResult.OTHER

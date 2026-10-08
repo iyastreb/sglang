@@ -72,6 +72,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -1514,11 +1515,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            prealloc_start = time.perf_counter()
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
+            )
+            perf_trace.emit(
+                "dec.prealloc",
+                rid=decode_req.req.rid,
+                room=decode_req.req.bootstrap_room,
+                tokens=origin_input_len,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                alloc_ms=(time.perf_counter() - prealloc_start) * 1e3,
             )
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
@@ -2735,6 +2746,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     continue
                 self._commit_transfer_to_req(decode_req)
+                perf_trace.emit(
+                    "dec.transfer_done",
+                    rid=decode_req.req.rid,
+                    room=decode_req.req.bootstrap_room,
+                )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):

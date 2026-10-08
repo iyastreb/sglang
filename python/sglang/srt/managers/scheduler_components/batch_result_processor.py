@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     SamplingMaskStatus,
@@ -121,6 +122,12 @@ class SchedulerBatchResultProcessor:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
+            perf_trace.emit(
+                "dec.prebuilt_done",
+                rid=req.rid,
+                room=req.bootstrap_room,
+                bs=len(batch.reqs),
+            )
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()

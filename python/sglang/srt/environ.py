@@ -360,6 +360,10 @@ class Envs:
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
+    # Per-request PD timeline probes (observability/perf_trace.py); JSONL under
+    # SGLANG_PERF_TRACE_DIR, else $LOG_DIR/profile.
+    SGLANG_PERF_TRACE = EnvBool(False)
+    SGLANG_PERF_TRACE_DIR = EnvStr(None)
 
     # ===================================================================
     # IPC, broadcasters, and ports

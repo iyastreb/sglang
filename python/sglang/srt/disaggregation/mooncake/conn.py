@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -2369,6 +2370,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
+                dequeue_time = time.perf_counter()
+                if perf_trace.ENABLED:
+                    perf_trace.emit(
+                        "xfer.dequeue",
+                        room=kv_chunk.room,
+                        chunk=kv_chunk.chunk_id,
+                        pages=len(kv_chunk.prefill_kv_indices),
+                        last=kv_chunk.is_last_chunk,
+                        worker=worker_index,
+                        src_runs=perf_trace.runs(kv_chunk.prefill_kv_indices),
+                    )
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -2450,6 +2462,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        send_start = time.perf_counter()
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -2536,6 +2549,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                                 target_rank_registration_info.dst_kv_layer_ids,
+                            )
+                        if perf_trace.ENABLED:
+                            perf_trace.emit(
+                                "xfer.done",
+                                room=kv_chunk.room,
+                                chunk=kv_chunk.chunk_id,
+                                last=kv_chunk.is_last_chunk,
+                                pages=len(kv_chunk.prefill_kv_indices),
+                                post_ms=(send_start - dequeue_time) * 1e3,
+                                wait_ms=(time.perf_counter() - send_start) * 1e3,
+                                ret=ret,
+                                dst_runs=perf_trace.runs(chunked_dst_kv_indice),
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -2872,6 +2897,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if parsed is None:
                     continue
                 room, status, prefill_rank, reason = parsed
+                perf_trace.emit(
+                    "dec.notif", room=room, status=status, prefill_rank=prefill_rank
+                )
                 self.apply_prefill_status(
                     bootstrap_room=room,
                     status=status,
@@ -2921,6 +2949,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        perf_trace.emit(
+            "xfer.enqueue",
+            room=bootstrap_room,
+            chunk=None,
+            pages=len(kv_indices),
+            last=is_last_chunk,
+            shard=shard_idx,
+        )
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -3277,6 +3313,13 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()
+        if perf_trace.ENABLED:
+            perf_trace.emit(
+                "dec.meta_sent",
+                room=self.bootstrap_room,
+                pages=len(kv_indices),
+                dst_runs=perf_trace.runs(kv_indices),
+            )
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

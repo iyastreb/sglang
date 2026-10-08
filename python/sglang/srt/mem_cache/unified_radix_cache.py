@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
@@ -1842,6 +1843,12 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id=node_id,
             extra_pools=aux_xfers or None,
         )
+        perf_trace.emit(
+            "hicache.load_issue",
+            rid=req.rid if req is not None else None,
+            tokens=kv_tokens,
+            ok=device_indices is not None,
+        )
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
@@ -3381,6 +3388,18 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+            if perf_trace.ENABLED:
+                perf_trace.emit(
+                    "hicache.write_ack",
+                    nodes=len(ack.node_ids),
+                    tokens=sum((ack.num_tokens_by_pool or {}).values()),
+                    bytes=ack.num_bytes,
+                    gpu_ms=(
+                        ack.start_event.elapsed_time(ack.finish_event)
+                        if ack.timing_enabled
+                        else None
+                    ),
+                )
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
@@ -3427,6 +3446,18 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            if perf_trace.ENABLED:
+                perf_trace.emit(
+                    "hicache.load_ack",
+                    nodes=len(ack.node_ids),
+                    tokens=sum((ack.num_tokens_by_pool or {}).values()),
+                    bytes=ack.num_bytes,
+                    gpu_ms=(
+                        ack.start_event.elapsed_time(ack.finish_event)
+                        if ack.timing_enabled
+                        else None
+                    ),
+                )
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None

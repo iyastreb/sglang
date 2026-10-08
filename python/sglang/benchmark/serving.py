@@ -108,6 +108,9 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    rid: str = ""
+    start_wall: float = 0.0
+    first_token_wall: float = 0.0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -728,6 +731,7 @@ async def async_request_sglang_generate(
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
+        output.start_wall = time.time()
         most_recent_timestamp = st
         last_output_len = 0
         try:
@@ -780,6 +784,8 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    output.first_token_wall = time.time()
+                                    output.rid = str(data["meta_info"].get("id", ""))
 
                                 # Decoding phase
                                 else:
@@ -1933,6 +1939,9 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "rids": [output.rid for output in outputs],
+        "start_walls": [output.start_wall for output in outputs],
+        "first_token_walls": [output.first_token_wall for output in outputs],
     }
 
     if args.cache_report:

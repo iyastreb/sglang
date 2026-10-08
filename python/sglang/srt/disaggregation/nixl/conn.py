@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -714,7 +715,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
     def _await_handles(
-        self, handles: List[Any], *, failure_seen: bool
+        self, handles: List[Any], *, failure_seen: bool, stats: Optional[dict] = None
     ) -> Tuple[bool, bool]:
         """Poll until every handle settled. Returns ``(settled, any_failed)``.
 
@@ -725,7 +726,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         since it does not prove the write into the decode's pages is over.
         """
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
+        polls = 0
         while True:
+            polls += 1
             all_settled = True
             any_failed = failure_seen
             try:
@@ -739,6 +742,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 logger.warning(f"Failed to read NIXL transfer state: {e}")
                 return False, True
             if all_settled:
+                if stats is not None:
+                    stats["polls"] = polls
                 return True, any_failed
             if not any_failed:
                 time.sleep(0)
@@ -1280,6 +1285,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
 
                 self.update_status(room, KVPoll.Transferring)
+                dequeue_time = time.perf_counter()
+                if perf_trace.ENABLED:
+                    perf_trace.emit(
+                        "xfer.dequeue",
+                        room=room,
+                        chunk=kv_chunk.chunk_id,
+                        pages=len(kv_chunk.prefill_kv_indices),
+                        last=kv_chunk.is_last_chunk,
+                        worker=worker_index,
+                        src_runs=perf_trace.runs(kv_chunk.prefill_kv_indices),
+                    )
 
                 reqs_to_be_processed = list(room_transfer_infos.values())
                 # Note(kpham-sgl): Pack each DCP rank once into its fixed region.
@@ -1500,7 +1516,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
-                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                await_start = time.perf_counter()
+                await_stats: dict = {}
+                settled, any_failed = self._await_handles(
+                    handles, failure_seen=False, stats=await_stats
+                )
+                perf_trace.emit(
+                    "xfer.done",
+                    room=room,
+                    chunk=kv_chunk.chunk_id,
+                    last=kv_chunk.is_last_chunk,
+                    pages=len(kv_chunk.prefill_kv_indices),
+                    handles=len(handles),
+                    post_ms=(await_start - dequeue_time) * 1e3,
+                    wait_ms=(time.perf_counter() - await_start) * 1e3,
+                    polls=await_stats.get("polls"),
+                )
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
@@ -1744,6 +1775,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_indices = repeat_indices_over_layers(
                 dst_data_indices, num_layers, num_slots_dst
             )
+            make_start = time.perf_counter()
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
                 src_prep,
@@ -1754,9 +1786,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
+            post_start = time.perf_counter()
             state = self.agent.transfer(xfer_handle)
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
+            if perf_trace.ENABLED:
+                perf_trace.emit(
+                    "xfer.posted",
+                    notif=notif,
+                    n_idx=len(src_indices),
+                    make_ms=(post_start - make_start) * 1e3,
+                    post_ms=(time.perf_counter() - post_start) * 1e3,
+                    src_runs=perf_trace.runs(prefill_data_indices),
+                    dst_runs=perf_trace.runs(dst_data_indices),
+                )
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -2848,6 +2891,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             info.dst_port for info in self.transfer_infos[bootstrap_room].values()
         )
         shard_idx = session_port_sum % len(self.transfer_queues)
+        perf_trace.emit(
+            "xfer.enqueue",
+            room=bootstrap_room,
+            chunk=chunk_id,
+            pages=len(kv_indices),
+            last=is_last_chunk,
+            shard=shard_idx,
+        )
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -2880,6 +2931,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 components = msg.decode("ascii").split("_", 8)
                 room = int(components[0])
                 tag = components[1]
+                if perf_trace.ENABLED:
+                    perf_trace.emit(
+                        "dec.notif", room=room, tag=tag, msg=msg.decode("ascii")
+                    )
                 if tag == "kv":
                     chunk_id = int(components[2])
                     is_last_chunk = bool(int(components[3]))
@@ -3144,6 +3199,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
+                perf_trace.emit(
+                    "pf.meta_recv",
+                    room=room,
+                    agent=agent_name,
+                    dst_pages=len(self.transfer_infos[room][agent_name].dst_kv_indices),
+                )
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
@@ -3382,6 +3443,13 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.started_transfer = True
         self.init_time = time.time()
+        if perf_trace.ENABLED:
+            perf_trace.emit(
+                "dec.meta_sent",
+                room=self.bootstrap_room,
+                pages=len(kv_indices),
+                dst_runs=perf_trace.runs(kv_indices),
+            )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:

@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -549,6 +550,7 @@ class CommonKVManager(BaseKVManager):
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
+        perf_trace.emit("kv.status", room=bootstrap_room, status=status, prev=current)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
             # request's opening status may create it: Bootstrapping normally, or

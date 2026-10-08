@@ -82,6 +82,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -558,6 +559,13 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        for req in bootstrapped_reqs:
+            perf_trace.emit(
+                "pf.bootstrapped",
+                rid=req.rid,
+                room=req.bootstrap_room,
+                pending=req.pending_bootstrap,
+            )
         if return_failed_reqs is False:
             return bootstrapped_reqs
         else:
@@ -682,6 +690,19 @@ class SchedulerDisaggregationPrefillMixin:
 
         if batch:
             set_schedule_time_batch(batch)
+        if batch and perf_trace.ENABLED:
+            for req in batch.reqs:
+                rng = req.extend_range
+                perf_trace.emit(
+                    "pf.forward_start",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    prefix_len=len(req.prefix_indices),
+                    extend_len=(rng.end - rng.start) if rng is not None else None,
+                    host_hit=req.host_hit_length,
+                    host_loaded=req.host_loaded_length,
+                    bs=len(batch.reqs),
+                )
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
@@ -957,6 +978,7 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                perf_trace.emit("pf.forward_done", rid=req.rid, room=req.bootstrap_room)
 
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
@@ -1183,6 +1205,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                perf_trace.emit(
+                    "pf.transfer_success", rid=req.rid, room=req.bootstrap_room
+                )
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
@@ -1665,6 +1690,15 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            perf_trace.emit(
+                "pf.send_chunk",
+                rid=req.rid,
+                room=req.bootstrap_room,
+                start=seg_start,
+                end=seg_end,
+                pages=len(page_indices),
+                last=segment_is_last,
+            )
             req.disagg_kv_sender.send(
                 page_indices,
                 send_state_indices,
