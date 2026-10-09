@@ -795,11 +795,13 @@ class SchedulerDisaggregationPrefillMixin:
         # Keep the newer forward's sampling context across unfinished-result passes.
         batch = None
         batch_result = None
+        self._perf_gpu_events = {}
 
         while True:
             if self.gracefully_exit:
                 break
 
+            loop_start = time.perf_counter()
             # Stop dispatching at pause requests while waiting for a batch result.
             received_inputs = self.ingest_requests(
                 stop_at_pause=waiting_for_batch_result
@@ -808,8 +810,11 @@ class SchedulerDisaggregationPrefillMixin:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
+            ingest_done = time.perf_counter()
             bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             self.waiting_queue.extend(bootstrapped_reqs)
+            bootstrap_done = time.perf_counter()
+            plan_done = run_done = bootstrap_done
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
@@ -838,11 +843,21 @@ class SchedulerDisaggregationPrefillMixin:
                 skip_batch_creation = batch is None
 
                 # Launch the current batch
+                plan_done = time.perf_counter()
                 if batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
                     run_start = time.perf_counter()
+                    gpu_events = None
+                    if perf_trace.ENABLED:
+                        gpu_events = [
+                            torch.cuda.Event(enable_timing=True) for _ in range(3)
+                        ]
+                        gpu_events[0].record(self.forward_stream)
                     batch_result = self.run_batch(batch)
+                    if gpu_events is not None:
+                        gpu_events[1].record(self.forward_stream)
+                        self._perf_gpu_events[id(batch_result)] = gpu_events
                     self._apply_war_barrier()
                     perf_trace.emit(
                         "pf.run_batch",
@@ -853,6 +868,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
                     batch_result = None
+                run_done = time.perf_counter()
 
             if self.last_batch:
                 if self.enable_continuous_input_polling:
@@ -873,12 +889,35 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+            result_done = time.perf_counter()
 
             self.process_disagg_prefill_inflight_queue()
+            inflight_done = time.perf_counter()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if batch is not None and batch_result is not None:
+                gpu_events = self._perf_gpu_events.get(id(batch_result))
+                if gpu_events is not None:
+                    gpu_events[2].record(self.forward_stream)
+            if perf_trace.ENABLED and (batch is not None or self.last_batch is not None):
+                now = time.perf_counter()
+                perf_trace.emit(
+                    "pf.loop",
+                    bs=batch.batch_size() if batch is not None else 0,
+                    ingest_ms=(ingest_done - loop_start) * 1e3,
+                    bootstrap_ms=(bootstrap_done - ingest_done) * 1e3,
+                    plan_ms=(plan_done - bootstrap_done) * 1e3,
+                    run_ms=(run_done - plan_done) * 1e3,
+                    result_ms=(result_done - run_done) * 1e3,
+                    inflight_ms=(inflight_done - result_done) * 1e3,
+                    sample_ms=(now - inflight_done) * 1e3,
+                    total_ms=(now - loop_start) * 1e3,
+                    waiting=len(self.waiting_queue),
+                    bootstrap_queue=len(self.disagg_prefill_bootstrap_queue.queue),
+                    inflight=len(self.disagg_prefill_inflight_queue),
+                )
 
             # Update last_batch and scheduler status
             self._sched_idled = batch is None
@@ -937,11 +976,22 @@ class SchedulerDisaggregationPrefillMixin:
         if copy_done is not None:
             wait_start = time.perf_counter()
             copy_done.synchronize()
+            gpu_fwd_ms = gpu_sample_ms = None
+            gpu_events = getattr(self, "_perf_gpu_events", {}).pop(id(result), None)
+            if gpu_events is not None:
+                try:
+                    gpu_events[2].synchronize()
+                    gpu_fwd_ms = gpu_events[0].elapsed_time(gpu_events[1])
+                    gpu_sample_ms = gpu_events[1].elapsed_time(gpu_events[2])
+                except Exception:
+                    pass
             perf_trace.emit(
                 "pf.result_wait",
                 bs=batch.batch_size(),
                 rooms=[req.bootstrap_room for req in batch.reqs],
                 wait_ms=(time.perf_counter() - wait_start) * 1e3,
+                gpu_fwd_ms=gpu_fwd_ms,
+                gpu_sample_ms=gpu_sample_ms,
             )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
