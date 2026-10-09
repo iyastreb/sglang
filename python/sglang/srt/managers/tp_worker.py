@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -23,6 +24,7 @@ import torch
 
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -618,12 +620,14 @@ class TpModelWorker(BaseTpWorker):
                 # Replay reads restored main/indexer KV before the normal extend.
                 run_encoder_swa_replay(self, batch)
 
+            init_new_start = time.perf_counter()
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
+            init_new_ms = (time.perf_counter() - init_new_start) * 1e3
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
@@ -638,11 +642,21 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
+            forward_start = time.perf_counter()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            if perf_trace.ENABLED and batch is not None:
+                perf_trace.emit(
+                    "pf.worker",
+                    bs=batch.batch_size(),
+                    rooms=[req.bootstrap_room for req in batch.reqs],
+                    init_new_ms=init_new_ms,
+                    forward_ms=(time.perf_counter() - forward_start) * 1e3,
+                    graph=bool(can_run_cuda_graph),
+                )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,

@@ -118,6 +118,7 @@ from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -485,6 +486,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if perf_trace.ENABLED:
+
+    class _PerfArrivalMiddleware:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                scope["perf_t0"] = time.time()
+            await self.app(scope, receive, send)
+
+    app.add_middleware(_PerfArrivalMiddleware)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (

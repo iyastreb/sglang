@@ -896,6 +896,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 rid=obj.rid,
                 room=obj.bootstrap_room,
                 received_time=obj.received_time,
+                http_t0=(
+                    request.scope.get("perf_t0")
+                    if isinstance(request, fastapi.Request)
+                    else None
+                ),
                 text_len=len(obj.text) if isinstance(obj.text, str) else None,
             )
         request_states = {
