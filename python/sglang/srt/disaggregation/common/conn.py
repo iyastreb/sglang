@@ -358,6 +358,9 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        # The bootstrap thread and the scheduler both create a room's status;
+        # an unlocked read-then-write lost the WaitingForInput update.
+        self._status_lock = threading.Lock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -549,34 +552,38 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        current = self.request_status.get(bootstrap_room)
-        perf_trace.emit("kv.status", room=bootstrap_room, status=status, prev=current)
-        if current is None:
-            # The room does not exist yet, or clear() already popped it. Only a
-            # request's opening status may create it: Bootstrapping normally, or
-            # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
-            # Anything else would resurrect a concluded room and pollute a later
-            # request that reuses the same bootstrap_room.
-            if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
-                # A new room lifecycle drops deferred-ACK state left by the
-                # previous request that used this bootstrap_room.
-                self._deferred_ack_targets.pop(bootstrap_room, None)
-                self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
-                self._staging_outstanding.pop(bootstrap_room, None)
-                self.request_status[bootstrap_room] = status
-            return
-        if status == KVPoll.Failed:
-            self.request_status[bootstrap_room] = KVPoll.Failed
-            if self.deferred_bootstrap is not None:
-                self._notify_bootstrap(
-                    bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
-                )
-            return
-        if current == KVPoll.Failed:
-            # Failed is terminal. It also sorts lowest, so the max() below would
-            # happily promote it back to Transferring or Success.
-            return
-        self.request_status[bootstrap_room] = max(current, status)
+        with self._status_lock:
+            current = self.request_status.get(bootstrap_room)
+            perf_trace.emit(
+                "kv.status", room=bootstrap_room, status=status, prev=current
+            )
+            if current is None:
+                # The room does not exist yet, or clear() already popped it. Only a
+                # request's opening status may create it: Bootstrapping normally, or
+                # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
+                # Anything else would resurrect a concluded room and pollute a later
+                # request that reuses the same bootstrap_room.
+                if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                    # A new room lifecycle drops deferred-ACK state left by the
+                    # previous request that used this bootstrap_room.
+                    self._deferred_ack_targets.pop(bootstrap_room, None)
+                    self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+                    self._staging_outstanding.pop(bootstrap_room, None)
+                    self.request_status[bootstrap_room] = status
+                return
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+                notify_failed = self.deferred_bootstrap is not None
+            else:
+                notify_failed = False
+                if current != KVPoll.Failed:
+                    # Failed is terminal. It also sorts lowest, so max() would
+                    # happily promote it back to Transferring or Success.
+                    self.request_status[bootstrap_room] = max(current, status)
+        if notify_failed:
+            self._notify_bootstrap(
+                bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
+            )
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:

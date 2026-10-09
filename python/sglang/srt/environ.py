@@ -364,6 +364,9 @@ class Envs:
     # SGLANG_PERF_TRACE_DIR, else $LOG_DIR/profile.
     SGLANG_PERF_TRACE = EnvBool(False)
     SGLANG_PERF_TRACE_DIR = EnvStr(None)
+    # Threads for --enable-dynamic-batch-tokenizer; above 1 each prompt is
+    # encoded on its own thread instead of one batched encode.
+    SGLANG_DYNAMIC_BATCH_TOKENIZER_WORKERS = EnvInt(1)
 
     # ===================================================================
     # IPC, broadcasters, and ports
@@ -720,6 +723,9 @@ class Envs:
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    # Post NIXL KV chunks without waiting for completion; Success is set when
+    # every chunk of the room has completed.
+    SGLANG_NIXL_PIPELINE_TRANSFERS = EnvBool(False)
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)

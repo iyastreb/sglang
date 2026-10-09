@@ -9,6 +9,8 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+
+from sglang.srt.environ import envs
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -40,8 +42,12 @@ class AsyncDynamicbatchTokenizer:
         self._queue: Optional[asyncio.Queue] = None
         self._batcher_task: Optional[asyncio.Task] = None
 
-        # Single-thread executor for blocking tokenizer calls
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Single-thread executor for blocking tokenizer calls; with more
+        # workers every prompt is encoded on its own thread (the fast tokenizer
+        # releases the GIL), skipping the batch queue.
+        workers = max(1, envs.SGLANG_DYNAMIC_BATCH_TOKENIZER_WORKERS.get())
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._parallel_encode = workers > 1
         self._initialized = False
 
     def _ensure_initialized(self):
@@ -57,6 +63,10 @@ class AsyncDynamicbatchTokenizer:
 
     async def encode(self, prompt: str, **kwargs) -> Any:
         """Encode a single prompt."""
+        if self._parallel_encode:
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, partial(self.tokenizer, prompt, **kwargs)
+            )
         self._ensure_initialized()
         result_future: asyncio.Future = asyncio.get_running_loop().create_future()
         await self._queue.put((prompt, kwargs, result_future))
