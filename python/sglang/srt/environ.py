@@ -728,6 +728,10 @@ class Envs:
     SGLANG_NIXL_PIPELINE_TRANSFERS = EnvBool(False)
     # Sleep between NIXL completion polls in the transfer worker; 0 yields only.
     SGLANG_NIXL_POLL_INTERVAL_US = EnvInt(0)
+    # Pipelined worker: chunks with at least this many pages count as big and at
+    # most MAX_BIG_INFLIGHT of them are posted at once; small chunks never wait.
+    SGLANG_NIXL_PIPELINE_BIG_PAGES = EnvInt(64)
+    SGLANG_NIXL_PIPELINE_MAX_BIG_INFLIGHT = EnvInt(1)
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)

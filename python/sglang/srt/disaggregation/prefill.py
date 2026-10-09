@@ -840,8 +840,15 @@ class SchedulerDisaggregationPrefillMixin:
                 if batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
+                    run_start = time.perf_counter()
                     batch_result = self.run_batch(batch)
                     self._apply_war_barrier()
+                    perf_trace.emit(
+                        "pf.run_batch",
+                        bs=batch.batch_size(),
+                        rooms=[req.bootstrap_room for req in batch.reqs],
+                        cpu_ms=(time.perf_counter() - run_start) * 1e3,
+                    )
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
                     batch_result = None
@@ -927,7 +934,14 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if copy_done is not None:
+            wait_start = time.perf_counter()
             copy_done.synchronize()
+            perf_trace.emit(
+                "pf.result_wait",
+                bs=batch.batch_size(),
+                rooms=[req.bootstrap_room for req in batch.reqs],
+                wait_ms=(time.perf_counter() - wait_start) * 1e3,
+            )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )

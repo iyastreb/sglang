@@ -7,7 +7,7 @@ import struct
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import msgspec
@@ -440,6 +440,7 @@ class _InflightChunk(msgspec.Struct, kw_only=True):
     dequeue_time: float
     await_start: float = 0.0
     polls: int = 0
+    big: bool = False
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
@@ -548,6 +549,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._peer_reload_times: Dict[str, float] = {}
         self._pipeline_transfers = envs.SGLANG_NIXL_PIPELINE_TRANSFERS.get()
         self._poll_interval_s = envs.SGLANG_NIXL_POLL_INTERVAL_US.get() / 1e6
+        self._pipeline_big_pages = envs.SGLANG_NIXL_PIPELINE_BIG_PAGES.get()
+        self._pipeline_max_big = envs.SGLANG_NIXL_PIPELINE_MAX_BIG_INFLIGHT.get()
         # Rooms whose last chunk completed while earlier chunks were in flight.
         self._room_last_done: Set[int] = set()
 
@@ -1278,42 +1281,71 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         prefix transfers of later requests on the same worker."""
         staging_strategy = None
         inflight: List[_InflightChunk] = []
+        # Big chunks held back while MAX_BIG_INFLIGHT of them are posted: a
+        # small chunk sharing the NIC with many large writes completes only
+        # when they drain, so big chunks go one after another, FIFO.
+        held_big: deque = deque()
+        big_inflight = 0
         while True:
-            kv_chunk = queue.get() if not inflight else queue.get_nowait()
+            idle = not inflight and not held_big
+            kv_chunk = queue.get() if idle else queue.get_nowait()
             progressed = kv_chunk is not None
             if kv_chunk is not None:
                 staging_strategy = self._ensure_staging_strategy(
                     staging_strategy, staging_buffer
                 )
-                rec = self._post_chunk(queue, kv_chunk, staging_strategy, worker_index)
+                if self._is_big_chunk(kv_chunk):
+                    held_big.append(kv_chunk)
+                else:
+                    rec = self._post_chunk(
+                        queue, kv_chunk, staging_strategy, worker_index
+                    )
+                    if rec is not None:
+                        rec.await_start = time.perf_counter()
+                        inflight.append(rec)
+            while held_big and big_inflight < self._pipeline_max_big:
+                rec = self._post_chunk(
+                    queue, held_big.popleft(), staging_strategy, worker_index
+                )
+                progressed = True
                 if rec is not None:
                     rec.await_start = time.perf_counter()
+                    rec.big = True
+                    big_inflight += 1
                     inflight.append(rec)
             still_running: List[_InflightChunk] = []
             for rec in inflight:
                 rec.polls += 1
+                finished = True
                 try:
                     states = [self.agent.check_xfer_state(h) for h in rec.handles]
                 except Exception as e:
                     logger.warning(f"Failed to read NIXL transfer state: {e}")
                     self._emit_chunk_done(rec, rec.polls)
                     self._complete_chunk(rec, settled=False, any_failed=True)
-                    progressed = True
-                    continue
-                if any(state == "ERR" for state in states):
-                    settled, _ = self._await_handles(rec.handles, failure_seen=True)
-                    self._emit_chunk_done(rec, rec.polls)
-                    self._complete_chunk(rec, settled, any_failed=True)
-                    progressed = True
-                elif all(state == "DONE" for state in states):
-                    self._emit_chunk_done(rec, rec.polls)
-                    self._complete_chunk(rec, settled=True, any_failed=False)
-                    progressed = True
                 else:
-                    still_running.append(rec)
+                    if any(state == "ERR" for state in states):
+                        settled, _ = self._await_handles(
+                            rec.handles, failure_seen=True
+                        )
+                        self._emit_chunk_done(rec, rec.polls)
+                        self._complete_chunk(rec, settled, any_failed=True)
+                    elif all(state == "DONE" for state in states):
+                        self._emit_chunk_done(rec, rec.polls)
+                        self._complete_chunk(rec, settled=True, any_failed=False)
+                    else:
+                        finished = False
+                        still_running.append(rec)
+                if finished:
+                    progressed = True
+                    if rec.big:
+                        big_inflight -= 1
             inflight = still_running
             if not progressed:
                 time.sleep(self._poll_interval_s)
+
+    def _is_big_chunk(self, kv_chunk: TransferKVChunk) -> bool:
+        return len(kv_chunk.prefill_kv_indices) >= self._pipeline_big_pages
 
     def _ensure_staging_strategy(self, staging_strategy, staging_buffer):
         # Lazily build a per-worker staging strategy bound to this
