@@ -886,6 +886,11 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     ):
                         waiting_for_batch_result = True
+                        # Also conclude finished transfers now: the router releases
+                        # the first token only once the prefill request completes,
+                        # and the readiness check above keeps all ranks on the same
+                        # pass, so the poll's TP all-reduce stays matched.
+                        self.process_disagg_prefill_inflight_queue()
                         self._yield_gil_if_needed()
                         continue
                 # Process the oldest batch result.
