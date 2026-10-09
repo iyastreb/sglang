@@ -553,6 +553,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._poll_interval_s = envs.SGLANG_NIXL_POLL_INTERVAL_US.get() / 1e6
         self._pipeline_big_pages = envs.SGLANG_NIXL_PIPELINE_BIG_PAGES.get()
         self._pipeline_max_big = envs.SGLANG_NIXL_PIPELINE_MAX_BIG_INFLIGHT.get()
+        # Bounds posted-but-unfinished chunks per worker. Each chunk is one SGL
+        # put of ~2*layers descriptors, so an unbounded burst exhausts the UCX
+        # send queue and lands in its pending path (hang seen at ISL 1k c256).
+        self._pipeline_max_inflight = envs.SGLANG_NIXL_PIPELINE_MAX_INFLIGHT.get()
         # Rooms whose last chunk completed while earlier chunks were in flight.
         self._room_last_done: Set[int] = set()
 
@@ -1312,6 +1316,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     still_waiting.append(kv_chunk)
                 elif self._is_big_chunk(kv_chunk):
                     held_big.append(kv_chunk)
+                elif len(inflight) >= self._pipeline_max_inflight:
+                    still_waiting.append(kv_chunk)
                 else:
                     rec = self._post_chunk(
                         queue, kv_chunk, staging_strategy, worker_index
