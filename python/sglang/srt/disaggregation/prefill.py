@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import logging
 import time
 from array import array
@@ -587,6 +588,8 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    disagg_page_index_stream: Optional[torch.cuda.Stream] = None
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -710,6 +713,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        self.disagg_page_index_stream = None
         while True:
             if self.gracefully_exit:
                 break
@@ -786,6 +790,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
+        self.disagg_page_index_stream = None
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
@@ -1541,19 +1546,35 @@ class SchedulerDisaggregationPrefillMixin:
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
-        # Only an earlier chunk of this request can still be writing these pages;
-        # a radix-cache prefix was written by forwards that already completed.
-        if self.enable_overlap and req.inflight_middle_chunks > 0:
+        # Pages can still be in flight when this request has an earlier chunk
+        # unprocessed, or when another chunked request's checkpointed pages (shared
+        # through the radix cache) are being written by a forward in flight.
+        if self.enable_overlap and (
+            req.inflight_middle_chunks > 0 or self._chunked_forward_pending()
+        ):
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end, early_send=True)
+
+    def _chunked_forward_pending(self: Scheduler) -> bool:
+        return any(
+            r.inflight_middle_chunks > 0
+            for batch, _ in self.result_queue
+            for r in batch.reqs
+        )
+
+    def _page_index_stream(self: Scheduler) -> torch.cuda.Stream:
+        if self.disagg_page_index_stream is None:
+            self.disagg_page_index_stream = torch.cuda.Stream()
+        return self.disagg_page_index_stream
 
     def send_kv_chunk(
         self,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        early_send: bool = False,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1566,13 +1587,16 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
             self.disagg_metadata_buffers.set_kv_checksum(req, value)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req, last_chunk=last_chunk, end_idx=end_idx, early_send=early_send
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        early_send: bool = False,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1738,6 +1762,13 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        # Chunks sent after their forward read rows that are already written, so
+        # their index copy may bypass the scheduler stream's WAR barrier; the
+        # early-send chunk's rows may still be pending on it.
+        async_indices = envs.SGLANG_DISAGG_ASYNC_PAGE_INDICES.get()
+        index_stream = (
+            self._page_index_stream() if async_indices and not early_send else None
+        )
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             raw_kv_indices = self.req_to_token_pool.req_to_token[
@@ -1745,13 +1776,16 @@ class SchedulerDisaggregationPrefillMixin:
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+            with (
+                torch.cuda.stream(index_stream)
+                if index_stream is not None
+                else contextlib.nullcontext()
+            ):
+                kv_indices = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
                     raw_kv_indices
                 )
-            )
-            if envs.SGLANG_DISAGG_ASYNC_PAGE_INDICES.get():
-                page_indices = LazyPageIndices(kv_indices, page_size)
+            if async_indices:
+                page_indices = LazyPageIndices(kv_indices, page_size, stream=index_stream)
             else:
                 page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
@@ -1768,6 +1802,7 @@ class SchedulerDisaggregationPrefillMixin:
                 end=seg_end,
                 pages=len(page_indices),
                 last=segment_is_last,
+                early=early_send,
             )
             req.disagg_kv_sender.send(
                 page_indices,

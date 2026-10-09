@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 import dataclasses
 import struct
@@ -79,12 +80,22 @@ class LazyPageIndices:
 
     __slots__ = ("_pinned", "_event", "_array")
 
-    def __init__(self, kv_indices: torch.Tensor, page_size: int):
-        pages = kv_indices[::page_size] // page_size
-        self._pinned = torch.empty(pages.shape, dtype=pages.dtype, pin_memory=True)
-        self._pinned.copy_(pages, non_blocking=True)
-        self._event = torch.cuda.Event()
-        self._event.record()
+    def __init__(
+        self,
+        kv_indices: torch.Tensor,
+        page_size: int,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        # On the scheduler's stream the copy inherits the WAR barrier and waits
+        # for the forward in flight; a side stream is only safe when the source
+        # rows are already written (chunks sent after their forward completed).
+        ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+        with ctx:
+            pages = kv_indices[::page_size] // page_size
+            self._pinned = torch.empty(pages.shape, dtype=pages.dtype, pin_memory=True)
+            self._pinned.copy_(pages, non_blocking=True)
+            self._event = torch.cuda.Event()
+            self._event.record()
         self._array: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
