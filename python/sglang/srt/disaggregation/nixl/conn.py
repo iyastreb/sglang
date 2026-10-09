@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_watermark_msg,
 )
 from sglang.srt.disaggregation.common.utils import (
+    page_indices_ready,
     resolve_page_indices,
     FastQueue,
     TransferKVChunk,
@@ -1282,33 +1283,44 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         prefix transfers of later requests on the same worker."""
         staging_strategy = None
         inflight: List[_InflightChunk] = []
+        # Chunks whose GPU events (early-send barrier, lazy index copy) are
+        # still pending; checked without blocking so completions keep flowing.
+        waiting: deque = deque()
         # Big chunks held back while MAX_BIG_INFLIGHT of them are posted: a
         # small chunk sharing the NIC with many large writes completes only
         # when they drain, so big chunks go one after another, FIFO.
         held_big: deque = deque()
         big_inflight = 0
         while True:
-            idle = not inflight and not held_big
+            idle = not inflight and not held_big and not waiting
             kv_chunk = queue.get() if idle else queue.get_nowait()
             progressed = kv_chunk is not None
             if kv_chunk is not None:
                 staging_strategy = self._ensure_staging_strategy(
                     staging_strategy, staging_buffer
                 )
-                if self._is_big_chunk(kv_chunk):
-                    # Count the held chunk now: a later small chunk of the same
-                    # room must not conclude the room while this one waits.
-                    if not kv_chunk.staging_counted and kv_chunk.room in self.request_status:
-                        self._staging_outstanding[kv_chunk.room] += 1
-                        kv_chunk.staging_counted = True
+                # Count the chunk now: a later small chunk of the same room
+                # must not conclude the room while this one waits.
+                if not kv_chunk.staging_counted and kv_chunk.room in self.request_status:
+                    self._staging_outstanding[kv_chunk.room] += 1
+                    kv_chunk.staging_counted = True
+                waiting.append(kv_chunk)
+            still_waiting: deque = deque()
+            while waiting:
+                kv_chunk = waiting.popleft()
+                if not self._chunk_ready(kv_chunk):
+                    still_waiting.append(kv_chunk)
+                elif self._is_big_chunk(kv_chunk):
                     held_big.append(kv_chunk)
                 else:
                     rec = self._post_chunk(
                         queue, kv_chunk, staging_strategy, worker_index
                     )
+                    progressed = True
                     if rec is not None:
                         rec.await_start = time.perf_counter()
                         inflight.append(rec)
+            waiting = still_waiting
             while held_big and big_inflight < self._pipeline_max_big:
                 rec = self._post_chunk(
                     queue, held_big.popleft(), staging_strategy, worker_index
@@ -1352,6 +1364,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def _is_big_chunk(self, kv_chunk: TransferKVChunk) -> bool:
         return len(kv_chunk.prefill_kv_indices) >= self._pipeline_big_pages
+
+    @staticmethod
+    def _chunk_ready(kv_chunk: TransferKVChunk) -> bool:
+        ev = kv_chunk.wait_event
+        if ev is not None and not ev.query():
+            return False
+        return page_indices_ready(kv_chunk.prefill_kv_indices)
 
     def _ensure_staging_strategy(self, staging_strategy, staging_buffer):
         # Lazily build a per-worker staging strategy bound to this

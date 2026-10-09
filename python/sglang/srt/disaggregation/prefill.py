@@ -1541,7 +1541,9 @@ class SchedulerDisaggregationPrefillMixin:
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
-        if self.enable_overlap:
+        # Only an earlier chunk of this request can still be writing these pages;
+        # a radix-cache prefix was written by forwards that already completed.
+        if self.enable_overlap and req.inflight_middle_chunks > 0:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev

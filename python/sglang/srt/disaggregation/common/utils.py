@@ -90,6 +90,9 @@ class LazyPageIndices:
     def __len__(self) -> int:
         return self._pinned.shape[0]
 
+    def ready(self) -> bool:
+        return self._array is not None or self._event.query()
+
     def resolve(self) -> np.ndarray:
         if self._array is None:
             self._event.synchronize()
@@ -99,6 +102,10 @@ class LazyPageIndices:
 
 def resolve_page_indices(indices):
     return indices.resolve() if isinstance(indices, LazyPageIndices) else indices
+
+
+def page_indices_ready(indices) -> bool:
+    return not isinstance(indices, LazyPageIndices) or indices.ready()
 
 
 class FastQueue:
