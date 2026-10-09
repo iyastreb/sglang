@@ -732,6 +732,9 @@ class Envs:
     # most MAX_BIG_INFLIGHT of them are posted at once; small chunks never wait.
     SGLANG_NIXL_PIPELINE_BIG_PAGES = EnvInt(64)
     SGLANG_NIXL_PIPELINE_MAX_BIG_INFLIGHT = EnvInt(1)
+    # Copy KV page indices device->host asynchronously for PD sends; the
+    # transfer worker waits on the copy instead of the scheduler thread.
+    SGLANG_DISAGG_ASYNC_PAGE_INDICES = EnvBool(False)
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)

@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_watermark_msg,
 )
 from sglang.srt.disaggregation.common.utils import (
+    resolve_page_indices,
     FastQueue,
     TransferKVChunk,
     build_dcp_token_transfer_plan,
@@ -1416,6 +1417,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 return None
 
             self.update_status(room, KVPoll.Transferring)
+            # Early-send pages may still be written by the prior forward, and
+            # lazily copied indices land only after their event; wait here, on
+            # the worker, rather than in the scheduler.
+            if kv_chunk.wait_event is not None:
+                kv_chunk.wait_event.synchronize()
+                kv_chunk.wait_event = None
+            kv_chunk.prefill_kv_indices = resolve_page_indices(
+                kv_chunk.prefill_kv_indices
+            )
             dequeue_time = time.perf_counter()
             if perf_trace.ENABLED:
                 perf_trace.emit(
@@ -3022,6 +3032,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3061,6 +3072,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None
@@ -3408,6 +3420,8 @@ class NixlKVSender(CommonKVSender):
         self._send_failed = False
         self._send_error: Optional[Exception] = None
         self._transfer_start_time: Optional[float] = None
+        # Set by the scheduler before an early cached-prefix send under overlap.
+        self._early_send_wait_event = None
 
     def send(
         self,
@@ -3429,6 +3443,8 @@ class NixlKVSender(CommonKVSender):
         ):
             self._transfer_start_time = time.perf_counter()
 
+        wait_event = self._early_send_wait_event
+        self._early_send_wait_event = None
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -3438,6 +3454,7 @@ class NixlKVSender(CommonKVSender):
             self.aux_index,
             state_indices,
             num_kv_tokens,
+            wait_event=wait_event,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1

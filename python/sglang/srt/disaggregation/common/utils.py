@@ -6,6 +6,7 @@ from collections import deque
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+import torch
 import numpy.typing as npt
 
 from sglang.srt.observability.trace import (
@@ -67,6 +68,37 @@ def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
         list(struct.unpack(f"<{len(b) // width}{fmt}", b))
         for b in unpack_list_of_buffers(buf)
     ]
+
+
+class LazyPageIndices:
+    """KV page indices copied device->host without blocking the caller.
+
+    The division and copy are enqueued on the current stream; resolve() waits
+    for the recorded event, so the wait moves to the transfer worker thread.
+    """
+
+    __slots__ = ("_pinned", "_event", "_array")
+
+    def __init__(self, kv_indices: torch.Tensor, page_size: int):
+        pages = kv_indices[::page_size] // page_size
+        self._pinned = torch.empty(pages.shape, dtype=pages.dtype, pin_memory=True)
+        self._pinned.copy_(pages, non_blocking=True)
+        self._event = torch.cuda.Event()
+        self._event.record()
+        self._array: Optional[np.ndarray] = None
+
+    def __len__(self) -> int:
+        return self._pinned.shape[0]
+
+    def resolve(self) -> np.ndarray:
+        if self._array is None:
+            self._event.synchronize()
+            self._array = self._pinned.numpy().astype(np.int32, copy=False)
+        return self._array
+
+
+def resolve_page_indices(indices):
+    return indices.resolve() if isinstance(indices, LazyPageIndices) else indices
 
 
 class FastQueue:

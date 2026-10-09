@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.disaggregation.common.utils import LazyPageIndices
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -1697,7 +1698,10 @@ class SchedulerDisaggregationPrefillMixin:
                     raw_kv_indices
                 )
             )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+            if envs.SGLANG_DISAGG_ASYNC_PAGE_INDICES.get():
+                page_indices = LazyPageIndices(kv_indices, page_size)
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last

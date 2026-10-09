@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_watermark_msg,
 )
 from sglang.srt.disaggregation.common.utils import (
+    resolve_page_indices,
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
@@ -2344,6 +2345,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ):
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
+                kv_chunk.prefill_kv_indices = resolve_page_indices(
+                    kv_chunk.prefill_kv_indices
+                )
 
                 if (
                     kv_chunk.room not in self.request_status
