@@ -726,6 +726,8 @@ class Envs:
     # Post NIXL KV chunks without waiting for completion; Success is set when
     # every chunk of the room has completed.
     SGLANG_NIXL_PIPELINE_TRANSFERS = EnvBool(False)
+    # Sleep between NIXL completion polls in the transfer worker; 0 yields only.
+    SGLANG_NIXL_POLL_INTERVAL_US = EnvInt(0)
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
