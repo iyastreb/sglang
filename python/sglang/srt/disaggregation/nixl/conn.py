@@ -1296,6 +1296,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     staging_strategy, staging_buffer
                 )
                 if self._is_big_chunk(kv_chunk):
+                    # Count the held chunk now: a later small chunk of the same
+                    # room must not conclude the room while this one waits.
+                    if not kv_chunk.staging_counted and kv_chunk.room in self.request_status:
+                        self._staging_outstanding[kv_chunk.room] += 1
+                        kv_chunk.staging_counted = True
                     held_big.append(kv_chunk)
                 else:
                     rec = self._post_chunk(
