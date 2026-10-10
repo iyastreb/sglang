@@ -87,6 +87,10 @@ class FastQueue:
                 self._cond.wait()
             return self._buf.popleft()
 
+    def get_nowait(self):
+        with self._cond:
+            return self._buf.popleft() if self._buf else None
+
 
 class AuxDataCodec:
     """Handles serialization and deserialization of auxiliary data buffers."""
