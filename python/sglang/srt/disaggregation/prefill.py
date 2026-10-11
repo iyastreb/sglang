@@ -1744,9 +1744,34 @@ class SchedulerDisaggregationPrefillMixin:
                         prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
-            state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            if perf_trace.ENABLED:
+                state_start = time.perf_counter()
+                state_indices = []
+                components = []
+                for st in state_types:
+                    component_start = time.perf_counter()
+                    indices = payloads[st]() if st in payloads else None
+                    component_ms = (time.perf_counter() - component_start) * 1e3
+                    state_indices.append(indices)
+                    components.append(
+                        {
+                            "type": st,
+                            "indices": len(indices) if indices is not None else 0,
+                            "ms": component_ms,
+                        }
+                    )
+                perf_trace.emit(
+                    "pf.state_indices",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    seq_len=seq_len,
+                    ms=(time.perf_counter() - state_start) * 1e3,
+                    components=components,
+                )
+            else:
+                state_indices = [
+                    payloads[st]() if st in payloads else None for st in state_types
+                ]
 
         transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
         if self.enable_staging:

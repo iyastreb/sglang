@@ -1999,6 +1999,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
         # 0xffff81ab54e01000). Casting here prevents overflow when these values
         # are later used in numpy arithmetic.
+        if perf_trace.ENABLED:
+            build_start = time.perf_counter()
         src_data_ptrs = np.array(src_data_ptrs, dtype=np.uint64)
         dst_data_ptrs = np.array(dst_data_ptrs, dtype=np.uint64)
         item_lens = np.array(item_lens, dtype=np.uint64)
@@ -2114,9 +2116,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_data_indices)}, after group: {len(src_addrs)}"
         )
+        if perf_trace.ENABLED:
+            desc_start = time.perf_counter()
         src_descs = self.agent.get_xfer_descs(src_reqs, src_mem_kind)
         dst_descs = self.agent.get_xfer_descs(dst_reqs, dst_mem_kind)
         # Transfer data
+        if perf_trace.ENABLED:
+            make_start = time.perf_counter()
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
             src_descs,
@@ -2126,9 +2132,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
+        if perf_trace.ENABLED:
+            post_start = time.perf_counter()
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
+        if perf_trace.ENABLED:
+            post_ms = (time.perf_counter() - post_start) * 1e3
+            perf_trace.emit(
+                "xfer.generic_posted",
+                notif=notif,
+                state_type=state_type,
+                n_idx=len(prefill_data_indices),
+                n_desc=len(src_reqs),
+                bytes=int(src_reqs[:, 1].sum()),
+                build_ms=(desc_start - build_start) * 1e3,
+                desc_ms=(make_start - desc_start) * 1e3,
+                make_ms=(post_start - make_start) * 1e3,
+                post_ms=post_ms,
+                src_runs=perf_trace.runs(prefill_data_indices),
+                dst_runs=perf_trace.runs(dst_data_indices),
+            )
         return xfer_handle
 
     def send_kvcache(
