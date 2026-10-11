@@ -81,6 +81,53 @@ _PEER_RELOAD_MIN_INTERVAL_S = 1.0
 
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
+_PREPARED_STATE_TAG = b"nixl-dsv4-state-v1:"
+_PREPARED_STATE_TYPES = (StateType.SWA, StateType.DSV4_REQUEST_STATE)
+
+
+def _unpack_prepared_state_capacities(data: bytes):
+    if not data.startswith(_PREPARED_STATE_TAG):
+        return None
+    value = json.loads(data[len(_PREPARED_STATE_TAG) :])
+    if not isinstance(value, dict):
+        raise ValueError("Invalid NIXL prepared state metadata")
+    types = value.get("types")
+    if not isinstance(types, list) or any(not isinstance(t, str) for t in types):
+        raise ValueError("Invalid NIXL prepared state component types")
+    if types != list(_PREPARED_STATE_TYPES):
+        return None
+    capacities = value.get("capacities")
+    if (
+        not isinstance(capacities, list)
+        or len(capacities) != len(_PREPARED_STATE_TYPES)
+        or any(
+            not isinstance(component, list)
+            or not component
+            or any(type(n) is not int or not 0 < n <= 0x7FFFFFFF for n in component)
+            for component in capacities
+        )
+    ):
+        raise ValueError("Invalid NIXL prepared state capacities")
+    return tuple(tuple(component) for component in capacities)
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedStateComponent:
+    state_type: StateType
+    src_offsets: tuple[int, ...]
+    dst_offsets: tuple[int, ...]
+    src_capacities: tuple[int, ...]
+    dst_capacities: tuple[int, ...]
+    item_lens: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedStatePlan:
+    src_handle: Any
+    dst_handle: Any
+    components: tuple[_PreparedStateComponent, ...]
+    dst_main_capacity: int
+
 
 # Once one handle of a batch reports ERR, its siblings settle only when NIXL
 # notices their peer is gone, which for UCX means waiting out peer keepalive.
@@ -258,6 +305,7 @@ class KVArgsRegisterInfo:
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    dst_prepared_state_capacities: Optional[tuple[tuple[int, ...], ...]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -333,6 +381,9 @@ class KVArgsRegisterInfo:
             ),
             staging_total_size=(
                 int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+            ),
+            dst_prepared_state_capacities=(
+                _unpack_prepared_state_capacities(msg[23]) if len(msg) > 23 else None
             ),
         )
 
@@ -465,6 +516,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._state_transfer_mode = envs.SGLANG_NIXL_STATE_TRANSFER_MODE.get()
+        if self._state_transfer_mode not in ("generic", "prepared", "fused"):
+            raise ValueError(
+                "SGLANG_NIXL_STATE_TRANSFER_MODE must be generic, prepared or fused"
+            )
         self.transfer_source_rank = (
             self.kv_args.pp_rank * get_parallel().tp_size + self.kv_args.engine_rank
         )
@@ -539,6 +595,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.register_buffer_to_engine()
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self._prepared_state_src = None
+        self._prepared_state_plans: Dict[str, _PreparedStatePlan] = {}
+        self._state_capacities, state_reason = self._local_prepared_state_capacities(
+            server_args, backend
+        )
+        logger.info(
+            "NIXL state transfer: requested=%s eligible=%s reason=%s",
+            self._state_transfer_mode,
+            self._state_capacities is not None,
+            state_reason,
+        )
         self.kv_buffer_tensors = None
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
@@ -604,6 +671,361 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _local_prepared_state_capacities(self, server_args, backend):
+        if self._state_transfer_mode == "generic":
+            return None, "disabled"
+        if (
+            backend != "UCX"
+            or server_args.device != "cuda"
+            or server_args.speculative_algorithm is not None
+            or self.pp_size != 1
+            or self.attn_cp_size != 1
+            or self.dcp_size != 1
+            or self.enable_staging
+            or not self.kv_args.mla_compression_ratios
+            or tuple(self.kv_args.state_types or []) != _PREPARED_STATE_TYPES
+            or any(kind != "VRAM" for kind in self.kv_args.kv_data_mem_kinds)
+        ):
+            return None, "unsupported-local-layout"
+        groups = (
+            self.kv_args.state_data_ptrs,
+            self.kv_args.state_data_lens,
+            self.kv_args.state_item_lens,
+        )
+        if any(len(group) != len(_PREPARED_STATE_TYPES) for group in groups):
+            raise ValueError("NIXL prepared state component geometry mismatch")
+        capacities = []
+        for ptrs, lengths, strides in zip(*groups):
+            if not (len(ptrs) == len(lengths) == len(strides)):
+                raise ValueError("NIXL prepared state entry geometry mismatch")
+            if not ptrs:
+                return None, "empty-state-component"
+            if any(
+                stride <= 0 or length < stride
+                for length, stride in zip(lengths, strides)
+            ):
+                raise ValueError("Invalid NIXL prepared state extent")
+            capacities.append(
+                tuple(length // stride for length, stride in zip(lengths, strides))
+            )
+        return tuple(capacities), "supported"
+
+    @staticmethod
+    def _prepared_runs(ptrs, strides, capacities, gpu_id, start):
+        if not (len(ptrs) == len(strides) == len(capacities)):
+            raise ValueError("NIXL prepared state run geometry mismatch")
+        runs, offsets = [], []
+        for ptr, stride, capacity in zip(ptrs, strides, capacities):
+            ptr, stride, capacity = int(ptr), int(stride), int(capacity)
+            if (
+                ptr <= 0
+                or stride <= 0
+                or capacity <= 0
+                or ptr + stride * capacity >= 1 << 64
+                or start + capacity > 1 << 31
+            ):
+                raise ValueError("NIXL prepared state address or index extent overflow")
+            offsets.append(start)
+            runs.append((ptr, stride, gpu_id, stride, capacity))
+            start += capacity
+        return runs, tuple(offsets), start
+
+    def _prepare_state_xfer(self, peer_info):
+        peer_name = peer_info.agent_name
+        self._prepared_state_plans.pop(peer_name, None)
+        if self._state_transfer_mode == "generic":
+            reason = "disabled"
+        elif self._state_capacities is None:
+            reason = "local-ineligible"
+        elif peer_info.dst_prepared_state_capacities is None:
+            reason = "missing-peer-capacities"
+        elif not self._use_strided_descs:
+            reason = "unsupported-striding"
+        else:
+            reason = "unsupported-peer-layout"
+        eligible = (
+            self._state_capacities is not None
+            and peer_info.dst_prepared_state_capacities is not None
+            and peer_info.decode_tp_size == self.attn_tp_size
+            and peer_info.dst_dcp_size == 1
+            and not peer_info.requires_dcp_relayout
+            and peer_info.kv_xfer_segments is None
+            and peer_info.dst_homogeneous_mem_kind == "VRAM"
+            and len(peer_info.dst_kv_ptrs) == len(self.kv_args.kv_data_ptrs)
+            and peer_info.dst_num_slots is not None
+            and self._use_strided_descs
+        )
+        if not eligible:
+            logger.info(
+                "NIXL state peer: peer=%s requested=%s effective=generic reason=%s",
+                peer_name,
+                self._state_transfer_mode,
+                reason,
+            )
+            return
+
+        src_runs, _, src_end = self._prepared_runs(
+            self.kv_args.kv_data_ptrs,
+            self.kv_args.kv_item_lens,
+            [self._num_slots_src] * len(self.kv_args.kv_data_ptrs),
+            self.kv_args.gpu_id,
+            0,
+        )
+        dst_entries = self._build_transfer_dst_indices(
+            peer_info=peer_info,
+            n_src=len(self.kv_args.kv_data_ptrs),
+            n_dst=len(peer_info.dst_kv_ptrs),
+        )
+        dst_main_strides = [peer_info.dst_kv_item_lens[j] for j in dst_entries]
+        if dst_main_strides != self.kv_args.kv_item_lens:
+            raise ValueError("NIXL prepared main strides differ between peers")
+        dst_runs, _, dst_end = self._prepared_runs(
+            [peer_info.dst_kv_ptrs[j] for j in dst_entries],
+            dst_main_strides,
+            [peer_info.dst_num_slots] * len(dst_entries),
+            peer_info.gpu_id,
+            0,
+        )
+        components = []
+        if not (
+            len(peer_info.dst_state_data_ptrs)
+            == len(peer_info.dst_state_item_lens)
+            == len(peer_info.dst_prepared_state_capacities)
+            == len(_PREPARED_STATE_TYPES)
+        ):
+            raise ValueError("NIXL prepared peer state component geometry mismatch")
+        for i, state_type in enumerate(_PREPARED_STATE_TYPES):
+            src_ptrs = self.kv_args.state_data_ptrs[i]
+            dst_ptrs = peer_info.dst_state_data_ptrs[i]
+            src_lens = self.kv_args.state_item_lens[i]
+            dst_lens = peer_info.dst_state_item_lens[i]
+            src_caps = self._state_capacities[i]
+            remote_caps = peer_info.dst_prepared_state_capacities[i]
+            if not (len(dst_ptrs) == len(dst_lens) == len(remote_caps)):
+                raise ValueError("NIXL prepared peer state entry geometry mismatch")
+            src_lids = self.kv_args.state_layer_ids
+            dst_lids = peer_info.dst_state_layer_ids
+            pairs = build_transfer_entry_pairs(
+                src_lids[i] if i < len(src_lids) else [],
+                dst_lids[i] if i < len(dst_lids) else [],
+                len(src_ptrs),
+                len(dst_ptrs),
+                allow_positional_fallback=True,
+            )
+            if any(src_lens[s] != dst_lens[d] for s, d in pairs):
+                raise RuntimeError(
+                    f"{state_type} item length mismatch for paired entries"
+                )
+            dst_caps = tuple(remote_caps[d] for _, d in pairs)
+            new_src, src_offsets, src_end = self._prepared_runs(
+                src_ptrs, src_lens, src_caps, self.kv_args.gpu_id, src_end
+            )
+            new_dst, dst_offsets, dst_end = self._prepared_runs(
+                [dst_ptrs[d] for _, d in pairs],
+                src_lens,
+                dst_caps,
+                peer_info.gpu_id,
+                dst_end,
+            )
+            src_runs.extend(new_src)
+            dst_runs.extend(new_dst)
+            components.append(
+                _PreparedStateComponent(
+                    state_type,
+                    src_offsets,
+                    dst_offsets,
+                    src_caps,
+                    dst_caps,
+                    tuple(src_lens),
+                )
+            )
+        try:
+            src_handle = self._prepared_state_src
+            if src_handle is None:
+                src_handle = self.agent.prep_xfer_dlist(
+                    "", self._pack_stride_descs(src_runs), "VRAM"
+                )
+            dst_handle = self.agent.prep_xfer_dlist(
+                peer_name, self._pack_stride_descs(dst_runs), "VRAM"
+            )
+        except TypeError:
+            logger.info(
+                "NIXL state peer: peer=%s requested=%s effective=generic "
+                "reason=unsupported-striding",
+                peer_name,
+                self._state_transfer_mode,
+            )
+            return
+        if src_handle is None or dst_handle is None:
+            raise RuntimeError("NIXL prepared state dlist creation failed")
+        self._prepared_state_src = src_handle
+        self._prepared_state_plans[peer_name] = _PreparedStatePlan(
+            src_handle, dst_handle, tuple(components), peer_info.dst_num_slots
+        )
+        logger.info(
+            "NIXL state peer: peer=%s requested=%s effective=%s reason=eligible "
+            "runs=%s state_entries=%s src_slots=%s dst_slots=%s",
+            peer_name,
+            self._state_transfer_mode,
+            self._state_transfer_mode,
+            len(src_runs),
+            [len(c.item_lens) for c in components],
+            src_end,
+            dst_end,
+        )
+
+    @staticmethod
+    def _select_prepared_indices(indices, offsets, capacities):
+        values = np.asarray(indices)
+        if values.ndim != 1:
+            raise ValueError("NIXL prepared state indices must be one-dimensional")
+        if values.size and values.dtype.kind not in ("i", "u"):
+            raise ValueError("NIXL prepared state indices must be integers")
+        if values.size and (values.min() < 0 or values.max() >= min(capacities)):
+            raise ValueError("NIXL prepared state index outside registered capacity")
+        values = values.astype(np.int64, copy=False)
+        return (
+            (np.asarray(offsets, dtype=np.int64)[:, None] + values)
+            .ravel()
+            .astype(np.int32)
+        )
+
+    def _select_prepared_state(self, plan, src_state_indices, dst_state_indices):
+        selections = []
+        for i, component in enumerate(plan.components):
+            src_indices = src_state_indices[i] if i < len(src_state_indices) else []
+            if src_indices is None or not len(src_indices):
+                continue
+            dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else []
+            if len(src_indices) != len(dst_indices):
+                raise RuntimeError(
+                    f"State index length mismatch at component {i}: "
+                    f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+                )
+            src = self._select_prepared_indices(
+                src_indices, component.src_offsets, component.src_capacities
+            )
+            dst = self._select_prepared_indices(
+                dst_indices, component.dst_offsets, component.dst_capacities
+            )
+            fields = None
+            if perf_trace.ENABLED:
+                fields = {
+                    "component_index": i,
+                    "state_type": component.state_type,
+                    "n_entries": len(component.item_lens),
+                    "selected_n_idx": len(src),
+                    "slot_count": len(src_indices),
+                    "bytes": sum(component.item_lens) * len(src_indices),
+                    "src_runs": perf_trace.runs(src_indices),
+                    "dst_runs": perf_trace.runs(dst_indices),
+                }
+            selections.append((src, dst, fields))
+        return selections
+
+    def _post_prepared_state(self, peer_name, src, dst, wire_notif, event, fields):
+        plan = self._prepared_state_plans[peer_name]
+        if perf_trace.ENABLED:
+            make_start = time.perf_counter()
+        handle = self.agent.make_prepped_xfer(
+            "WRITE",
+            plan.src_handle,
+            src,
+            plan.dst_handle,
+            dst,
+            wire_notif.encode("ascii"),
+        )
+        if not handle:
+            raise RuntimeError("NIXL prepared state transfer creation failed")
+        if perf_trace.ENABLED:
+            post_start = time.perf_counter()
+        if self.agent.transfer(handle) == "ERR":
+            raise RuntimeError("NIXL prepared state transfer posting failed")
+        if perf_trace.ENABLED:
+            perf_trace.emit(
+                event,
+                **fields,
+                make_ms=(post_start - make_start) * 1e3,
+                post_ms=(time.perf_counter() - post_start) * 1e3,
+            )
+        return handle
+
+    def _send_prepared_state(
+        self, peer_name, src_state_indices, dst_state_indices, notif
+    ):
+        if perf_trace.ENABLED:
+            start = time.perf_counter()
+        selections = self._select_prepared_state(
+            self._prepared_state_plans[peer_name], src_state_indices, dst_state_indices
+        )
+        # Both selections are prepared together; charge that work only once.
+        index_ms = (time.perf_counter() - start) * 1e3 if perf_trace.ENABLED else 0.0
+        for src, dst, fields in selections:
+            if perf_trace.ENABLED:
+                fields = dict(
+                    fields,
+                    notif=f"{notif}_{fields['component_index']}",
+                    mode="prepared",
+                    index_ms=index_ms,
+                )
+            yield self._post_prepared_state(
+                peer_name, src, dst, "", "xfer.prepared_posted", fields
+            )
+            index_ms = 0.0
+
+    def _send_fused_state(
+        self,
+        peer_name,
+        src_indices,
+        dst_indices,
+        src_state_indices,
+        dst_state_indices,
+        notif,
+        state_notif,
+    ):
+        if perf_trace.ENABLED:
+            start = time.perf_counter()
+        plan = self._prepared_state_plans[peer_name]
+        n_main = len(self.kv_args.kv_data_ptrs)
+        src = self._select_prepared_indices(
+            src_indices,
+            tuple(i * self._num_slots_src for i in range(n_main)),
+            (self._num_slots_src,) * n_main,
+        )
+        dst = self._select_prepared_indices(
+            dst_indices,
+            tuple(i * plan.dst_main_capacity for i in range(n_main)),
+            (plan.dst_main_capacity,) * n_main,
+        )
+        if len(src) != len(dst):
+            raise ValueError("NIXL fused main index length mismatch")
+        selections = self._select_prepared_state(
+            plan, src_state_indices, dst_state_indices
+        )
+        fields = None
+        if perf_trace.ENABLED:
+            fields = {
+                "notif": notif,
+                "mode": "fused",
+                "main_n_idx": len(src),
+                "main_bytes": sum(self.kv_args.kv_item_lens) * len(src_indices),
+                "state_n_idx": sum(len(s) for s, _, _ in selections),
+                "state_bytes": sum(f["bytes"] for _, _, f in selections),
+                "components": [
+                    dict(f, notif=f"{state_notif}_{f['component_index']}")
+                    for _, _, f in selections
+                ],
+            }
+        src = np.concatenate([src] + [s for s, _, _ in selections])
+        dst = np.concatenate([dst] + [d for _, d, _ in selections])
+        if perf_trace.ENABLED:
+            fields["index_ms"] = (time.perf_counter() - start) * 1e3
+            fields["src_runs"] = perf_trace.runs(src_indices)
+            fields["dst_runs"] = perf_trace.runs(dst_indices)
+        return self._post_prepared_state(
+            peer_name, src, dst, notif, "xfer.fused_posted", fields
+        )
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1491,6 +1913,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 assert req.agent_name in self.decode_kv_args_table
                 dst_info = self.decode_kv_args_table[req.agent_name]
                 decode_tp_size = dst_info.decode_tp_size
+                fused_state = False
 
                 # Skip KV RDMA transfer when there are no pages to send
                 # (e.g., decode-side radix cache matched the entire prefix).
@@ -1609,17 +2032,35 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     raise RuntimeError(
                                         "Missing NIXL destination KV memory kind"
                                     )
-                                kv_xfer_handle = self.send_kvcache(
-                                    req.agent_name,
-                                    src_prefill_kv_indices,
-                                    dst_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    dst_info.gpu_id,
-                                    notif,
-                                    dst_mem_kind=(
-                                        dst_info.dst_homogeneous_mem_kind
-                                    ),
+                                fused_state = (
+                                    self._state_transfer_mode == "fused"
+                                    and kv_chunk.is_last_chunk
+                                    and bool(kv_chunk.state_indices)
+                                    and len(src_prefill_kv_indices) > 0
+                                    and req.agent_name in self._prepared_state_plans
                                 )
+                                if fused_state:
+                                    kv_xfer_handle = self._send_fused_state(
+                                        req.agent_name,
+                                        src_prefill_kv_indices,
+                                        chunked_dst_kv_indice,
+                                        kv_chunk.state_indices,
+                                        req.dst_state_indices,
+                                        notif,
+                                        f"{req.room}_state_{self.transfer_source_rank}",
+                                    )
+                                else:
+                                    kv_xfer_handle = self.send_kvcache(
+                                        req.agent_name,
+                                        src_prefill_kv_indices,
+                                        dst_info.dst_kv_ptrs,
+                                        chunked_dst_kv_indice,
+                                        dst_info.gpu_id,
+                                        notif,
+                                        dst_mem_kind=(
+                                            dst_info.dst_homogeneous_mem_kind
+                                        ),
+                                    )
                             else:
                                 handles.extend(
                                     self.send_kvcache_mixed(
@@ -1642,7 +2083,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 if kv_chunk.is_last_chunk:
                     dst_info = self.decode_kv_args_table[req.agent_name]
-                    if kv_chunk.state_indices:
+                    if kv_chunk.state_indices and not fused_state:
                         state_xfer_handles = self.maybe_send_extra(
                             req.agent_name,
                             kv_chunk.state_indices,
@@ -1898,6 +2339,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
+            self._prepare_state_xfer(decode_kv_args)
 
     def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
         # NIXL drops a peer's metadata after a remote-disconnect error and never
@@ -1925,10 +2367,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # peer has the same peer set, so all shard to this worker.
                     self.prep_handles.pop(agent_name, None)
                     self.prep_handles_slice_dst.pop(agent_name, None)
+                    self._prepared_state_plans.pop(agent_name, None)
                     peer_info.kv_xfer_segments = None
                     self.agent.add_remote_agent(peer_info.agent_metadata)
                     try:
                         self._prepare_payload_xfer(peer_info)
+                        self._prepare_state_xfer(peer_info)
                     except Exception:
                         # Leave the peer invalid so a later failure retries.
                         self.agent.remove_remote_agent(agent_name)
@@ -2918,6 +3362,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_layer_ids: List[List[int]] | None = None,
     ):
         """Yield each posted state handle before constructing the next component."""
+        if (
+            self._state_transfer_mode == "prepared"
+            and peer_name in self._prepared_state_plans
+        ):
+            yield from self._send_prepared_state(
+                peer_name, prefill_state_indices, dst_state_indices, notif
+            )
+            return
         state_types = getattr(self.kv_args, "state_types", []) or []
         src_state_data_ptrs = self.kv_args.state_data_ptrs or []
         src_state_item_lens = self.kv_args.state_item_lens or []
@@ -3818,6 +4270,19 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
+                            *(
+                                [
+                                    _PREPARED_STATE_TAG
+                                    + json.dumps(
+                                        {
+                                            "types": _PREPARED_STATE_TYPES,
+                                            "capacities": self.kv_mgr._state_capacities,
+                                        }
+                                    ).encode("ascii")
+                                ]
+                                if self.kv_mgr._state_capacities is not None
+                                else []
+                            ),
                         ]
                     )
             except zmq.ZMQError:
