@@ -550,6 +550,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._peer_reload_lock = threading.Lock()
         self._peer_reload_times: Dict[str, float] = {}
         self._pipeline_transfers = envs.SGLANG_NIXL_PIPELINE_TRANSFERS.get()
+        self._vectorize_state_descriptors = (
+            envs.SGLANG_NIXL_VECTORIZE_STATE_DESCRIPTORS.get()
+        )
         self._poll_interval_s = envs.SGLANG_NIXL_POLL_INTERVAL_US.get() / 1e6
         self._pipeline_big_pages = envs.SGLANG_NIXL_PIPELINE_BIG_PAGES.get()
         self._pipeline_max_big = envs.SGLANG_NIXL_PIPELINE_MAX_BIG_INFLIGHT.get()
@@ -2072,11 +2075,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not layers_params:
             return None
 
-        src_addrs = []
-        src_lens = []
-        dst_addrs = []
-        dst_lens = []
-
         # Precompute block starts/lengths to reduce Python-level loops.
         prefill_starts = np.fromiter(
             (block[0] for block in prefill_kv_blocks), dtype=np.uint64
@@ -2086,35 +2084,56 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             (len(block) for block in prefill_kv_blocks), dtype=np.uint64
         )
 
-        for src_ptr, dst_ptr, item_len in layers_params:
-            lengths = item_len * block_lens
-            src_addrs.append(src_ptr + prefill_starts * item_len)
-            src_lens.append(lengths)
-            dst_addrs.append(dst_ptr + dst_starts * item_len)
-            dst_lens.append(lengths)
+        if self._vectorize_state_descriptors and state_type is not None:
+            params = np.asarray(layers_params, dtype=np.uint64)
+            item_sizes = params[:, 2, None]
+            src_reqs = np.empty(
+                (len(layers_params), len(block_lens), 3), dtype=np.uint64
+            )
+            dst_reqs = np.empty_like(src_reqs)
+            src_reqs[:, :, 0] = params[:, 0, None] + item_sizes * prefill_starts
+            dst_reqs[:, :, 0] = params[:, 1, None] + item_sizes * dst_starts
+            src_reqs[:, :, 1] = item_sizes * block_lens
+            dst_reqs[:, :, 1] = src_reqs[:, :, 1]
+            src_reqs[:, :, 2] = _nixl_device_id(src_mem_kind, self.kv_args.gpu_id)
+            dst_reqs[:, :, 2] = _nixl_device_id(dst_mem_kind, dst_gpu_id)
+            # Preserve the existing entry-major, then block-major descriptor order.
+            src_reqs = src_reqs.reshape(-1, 3)
+            dst_reqs = dst_reqs.reshape(-1, 3)
+        else:
+            src_addrs = []
+            src_lens = []
+            dst_addrs = []
+            dst_lens = []
+            for src_ptr, dst_ptr, item_len in layers_params:
+                lengths = item_len * block_lens
+                src_addrs.append(src_ptr + prefill_starts * item_len)
+                src_lens.append(lengths)
+                dst_addrs.append(dst_ptr + dst_starts * item_len)
+                dst_lens.append(lengths)
 
-        def make_req_array(addr_chunks, len_chunks, gpu):
-            if not addr_chunks:
-                return np.empty((0, 3), dtype=np.uint64)
-            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
-            flat_lens = np.concatenate(len_chunks).astype(np.uint64, copy=False)
-            return np.column_stack(
-                (
-                    flat_addrs,
-                    flat_lens,
-                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
+            def make_req_array(addr_chunks, len_chunks, gpu):
+                if not addr_chunks:
+                    return np.empty((0, 3), dtype=np.uint64)
+                flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
+                flat_lens = np.concatenate(len_chunks).astype(np.uint64, copy=False)
+                return np.column_stack(
+                    (
+                        flat_addrs,
+                        flat_lens,
+                        np.full_like(flat_addrs, gpu, dtype=np.uint64),
+                    )
                 )
+
+            src_reqs = make_req_array(
+                src_addrs, src_lens, _nixl_device_id(src_mem_kind, self.kv_args.gpu_id)
+            )
+            dst_reqs = make_req_array(
+                dst_addrs, dst_lens, _nixl_device_id(dst_mem_kind, dst_gpu_id)
             )
 
-        src_reqs = make_req_array(
-            src_addrs, src_lens, _nixl_device_id(src_mem_kind, self.kv_args.gpu_id)
-        )
-        dst_reqs = make_req_array(
-            dst_addrs, dst_lens, _nixl_device_id(dst_mem_kind, dst_gpu_id)
-        )
-
         logger.debug(
-            f"len(src_addrs): before group: {len(prefill_data_indices)}, after group: {len(src_addrs)}"
+            f"len(src_addrs): before group: {len(prefill_data_indices)}, after group: {len(layers_params)}"
         )
         if perf_trace.ENABLED:
             desc_start = time.perf_counter()

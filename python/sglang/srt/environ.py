@@ -726,6 +726,7 @@ class Envs:
     # Post NIXL KV chunks without waiting for completion; Success is set when
     # every chunk of the room has completed.
     SGLANG_NIXL_PIPELINE_TRANSFERS = EnvBool(False)
+    SGLANG_NIXL_VECTORIZE_STATE_DESCRIPTORS = EnvBool(False)
     # Sleep between NIXL completion polls in the transfer worker; 0 yields only.
     SGLANG_NIXL_POLL_INTERVAL_US = EnvInt(0)
     # Pipelined worker: chunks with at least this many pages count as big and at
