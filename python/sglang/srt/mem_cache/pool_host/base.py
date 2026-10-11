@@ -427,6 +427,12 @@ class HostKVCache(abc.ABC):
         """
         return host_indices, device_indices
 
+    def prepare_load_to_device_indices(
+        self, host_indices, device_indices, io_backend
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Prepare reusable page rows on the H2D stream after index resolution."""
+        return None
+
     def backup_from_device_all_layer_physical(
         self, device_pool, host_indices, device_indices, io_backend
     ) -> None:
@@ -443,7 +449,9 @@ class HostKVCache(abc.ABC):
         io_backend,
         *,
         is_draft: bool = False,
+        page_indices: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
+        kwargs = {} if page_indices is None else {"page_indices": page_indices}
         self.load_to_device_per_layer(
             device_pool,
             host_indices,
@@ -451,6 +459,7 @@ class HostKVCache(abc.ABC):
             layer_id,
             io_backend,
             is_draft=is_draft,
+            **kwargs,
         )
 
     @abc.abstractmethod

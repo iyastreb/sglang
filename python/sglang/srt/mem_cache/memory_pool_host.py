@@ -552,6 +552,25 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
             )
 
+    def prepare_load_to_device_indices(
+        self, host_indices, device_indices, io_backend
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            not _is_cuda
+            or io_backend != "kernel"
+            or self.layout not in ("layer_first", "page_first")
+            or host_indices is None
+            or device_indices is None
+            or not host_indices.is_cuda
+            or not device_indices.is_cuda
+            or host_indices.numel() == 0
+            or host_indices.numel() != device_indices.numel()
+            or host_indices.numel() % self.slot_page_size != 0
+            or device_indices.numel() % self.slot_page_size != 0
+        ):
+            return None
+        return self._to_page_indices(host_indices), self._to_page_indices(device_indices)
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -561,6 +580,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
+        page_indices: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if not self._has_transfer_indices(host_indices, device_indices):
             return
@@ -579,8 +599,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=device_indices.to(dtype=torch.int64),
             )
             return
-        host_rows = self._to_page_indices(host_indices)
-        device_rows = self._to_page_indices(device_indices)
+        if page_indices is None:
+            host_rows = self._to_page_indices(host_indices)
+            device_rows = self._to_page_indices(device_indices)
+        else:
+            host_rows, device_rows = page_indices
 
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
@@ -1037,6 +1060,23 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 f"Unsupported V4 state host layout/backend: {self.layout}/{io_backend}"
             )
 
+    def prepare_load_to_device_indices(
+        self, host_indices, device_indices, io_backend
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            not _is_cuda
+            or io_backend != "kernel"
+            or self.layout not in ("layer_first", "page_first")
+            or host_indices is None
+            or device_indices is None
+            or not host_indices.is_cuda
+            or not device_indices.is_cuda
+            or host_indices.numel() % self.swa_page_size != 0
+            or device_indices.numel() % self.swa_page_size != 0
+        ):
+            return None
+        return self._to_page_indices(host_indices), self._to_page_indices(device_indices)
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1046,11 +1086,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
         io_backend,
         *,
         is_draft: bool = False,
+        page_indices: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if host_indices is None or device_indices is None:
             return
-        host_rows = self._to_page_indices(host_indices)
-        device_rows = self._to_page_indices(device_indices)
+        if page_indices is None:
+            host_rows = self._to_page_indices(host_indices)
+            device_rows = self._to_page_indices(device_indices)
+        else:
+            host_rows, device_rows = page_indices
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
                 src=self.data_refs[layer_id],

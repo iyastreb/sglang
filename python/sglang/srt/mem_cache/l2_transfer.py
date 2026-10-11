@@ -153,8 +153,10 @@ class L2TransferEngine:
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
             primary = transfers[0] if transfers else None
+            load_kwargs = {}
+            resolved_indices = []
             for layer_id in range(transfer_layer_id_max):
-                for transfer in transfers:
+                for transfer_index, transfer in enumerate(transfers):
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
                         if transfer.layer_mapper is not None
@@ -166,6 +168,21 @@ class L2TransferEngine:
                         and layer_id >= transfer.host_pool.layer_num
                     ):
                         continue
+                    if transfer_index not in load_kwargs:
+                        kwargs = {}
+                        prepare_load_indices = getattr(
+                            transfer.host_pool, "prepare_load_to_device_indices", None
+                        )
+                        if prepare_load_indices is not None:
+                            page_indices = prepare_load_indices(
+                                transfer.host_indices,
+                                transfer.device_indices,
+                                self.io_backend,
+                            )
+                            if page_indices is not None:
+                                kwargs["page_indices"] = page_indices
+                                resolved_indices.extend(page_indices)
+                        load_kwargs[transfer_index] = kwargs
                     transfer.host_pool.load_to_device_per_layer_physical(
                         transfer.device_pool,
                         transfer.host_indices,
@@ -173,9 +190,11 @@ class L2TransferEngine:
                         local_layer_id,
                         self.io_backend,
                         is_draft=transfer.is_draft,
+                        **load_kwargs[transfer_index],
                     )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
+            self._record_stream([], self.host_to_device_stream, resolved_indices)
         return completion
 
     @staticmethod
