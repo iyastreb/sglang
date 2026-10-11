@@ -207,6 +207,28 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
+    @torch.no_grad()
+    def initialize_dummy_weights(self, layer: Module, seed: int) -> Tuple[int, str]:
+        """Initialize packed weights; return their count and log description."""
+        pairs = (
+            (layer.w13_weight, layer.w13_weight_scale_inv),
+            (layer.w2_weight, layer.w2_weight_scale_inv),
+        )
+        for weight, weight_scale in pairs:
+            if (
+                weight.dtype != torch.int8
+                or weight_scale.dtype != torch.float32
+                or weight_scale.format_ue8m0
+            ):
+                raise ValueError("Initialize dummy MXFP4 weights before conversion")
+
+        # Every E2M1 nibble is finite (max 6). Keep the existing dummy scales.
+        for weight, _ in pairs:
+            generator = torch.Generator(device=weight.device)
+            generator.manual_seed(seed)
+            weight.random_(-128, 128, generator=generator)
+        return len(pairs), "packed MXFP4 (unit scales)"
+
     def process_weights_after_loading(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 

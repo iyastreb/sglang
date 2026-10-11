@@ -1658,6 +1658,21 @@ def initialize_dummy_weights(
             else:
                 param.uniform_(low, high, generator=generator)
 
+    quantized_counts = collections.Counter()
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        initializer = getattr(quant_method, "initialize_dummy_weights", None)
+        if initializer is not None:
+            count, description = initializer(module, seed=seed)
+            quantized_counts[description] += count
+    for description, count in quantized_counts.items():
+        logger.info(
+            "Initialized %d %s dummy weight tensors (seed=%d)",
+            count,
+            description,
+            seed,
+        )
+
 
 def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
     """Remap the name of FP8 k/v_scale parameters.
