@@ -1796,8 +1796,15 @@ class SchedulerDisaggregationPrefillMixin:
         # their index copy may bypass the scheduler stream's WAR barrier; the
         # early-send chunk's rows may still be pending on it.
         async_indices = envs.SGLANG_DISAGG_ASYNC_PAGE_INDICES.get()
+        # DSv4 checkpoints can rebind req_to_token after forward completion.
+        # Keep its index reads ordered on the scheduler stream.
+        dsv4_pool = isinstance(
+            self.token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool
+        )
         index_stream = (
-            self._page_index_stream() if async_indices and not early_send else None
+            self._page_index_stream()
+            if async_indices and not early_send and not dsv4_pool
+            else None
         )
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
