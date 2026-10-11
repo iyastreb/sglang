@@ -55,7 +55,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.observability import perf_trace
-from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
+from sglang.srt.runtime_context import get_device, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -598,7 +598,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._prepared_state_src = None
         self._prepared_state_plans: Dict[str, _PreparedStatePlan] = {}
         self._state_capacities, state_reason = self._local_prepared_state_capacities(
-            server_args, backend
+            backend
         )
         logger.info(
             "NIXL state transfer: requested=%s eligible=%s reason=%s",
@@ -672,13 +672,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    def _local_prepared_state_capacities(self, server_args, backend):
+    def _local_prepared_state_capacities(self, backend):
         if self._state_transfer_mode == "generic":
             return None, "disabled"
+        if get_device().device != "cuda":
+            return None, "unsupported-device"
+        if get_spec().speculative_algorithm is not None:
+            return None, "unsupported-speculation"
         if (
             backend != "UCX"
-            or server_args.device != "cuda"
-            or server_args.speculative_algorithm is not None
             or self.pp_size != 1
             or self.attn_cp_size != 1
             or self.dcp_size != 1
