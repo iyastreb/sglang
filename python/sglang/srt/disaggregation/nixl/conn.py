@@ -438,6 +438,7 @@ class _InflightChunk(msgspec.Struct, kw_only=True):
     kv_chunk: Any
     room: int
     handles: List[Any]
+    state_notifs: List[Tuple[str, str]]
     room_transfer_infos: Any
     dequeue_time: float
     await_start: float = 0.0
@@ -1417,6 +1418,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         """Post every transfer of one chunk; None when skipped, deferred or failed."""
         room = kv_chunk.room
         handles: List[Any] = []
+        state_notifs: List[Tuple[str, str]] = []
         room_transfer_infos = None
         try:
             if room not in self.request_status:
@@ -1657,6 +1659,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         handles.extend(
                             h for h in state_xfer_handles if h is not None
                         )
+                    if req.dst_state_indices:
+                        state_notifs.append(
+                            (
+                                req.agent_name,
+                                f"{req.room}_state_{self.transfer_source_rank}",
+                            )
+                        )
 
                     if kv_chunk.prefill_aux_index is None:
                         raise RuntimeError("Missing aux index for last chunk")
@@ -1687,6 +1696,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 kv_chunk=kv_chunk,
                 room=room,
                 handles=handles,
+                state_notifs=state_notifs,
                 room_transfer_infos=room_transfer_infos,
                 dequeue_time=dequeue_time,
             )
@@ -1706,6 +1716,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             if any_failed:
                 raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+
+            if self.request_status.get(room) not in (None, KVPoll.Failed):
+                # One source marker covers every state component, on any worker.
+                for peer_name, notif in rec.state_notifs:
+                    self.agent.send_notif(peer_name, notif.encode("ascii"))
 
             # Clear with the decrement: the failure path below reads this
             # flag, so a raise after this point must not uncount twice.
@@ -1941,6 +1956,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
         dst_item_lens: Optional[List[int]] = None,
+        wire_notif: Optional[str] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1948,6 +1964,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V."""
+        wire_notif = notif if wire_notif is None else wire_notif
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
             not bypass_prepped
@@ -1977,7 +1994,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_indices,
                 dst_prep,
                 dst_indices,
-                notif.encode("ascii"),
+                wire_notif.encode("ascii"),
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
@@ -2147,7 +2164,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_descs,
             dst_descs,
             peer_name,
-            notif.encode("ascii"),  # type: ignore
+            wire_notif.encode("ascii"),
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
@@ -2900,7 +2917,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_dim_per_tensor: List[List[int]] | None = None,
         dst_state_layer_ids: List[List[int]] | None = None,
     ):
-        """Send state per hybrid component, dispatching by state_type[i]."""
+        """Yield each posted state handle before constructing the next component."""
         state_types = getattr(self.kv_args, "state_types", []) or []
         src_state_data_ptrs = self.kv_args.state_data_ptrs or []
         src_state_item_lens = self.kv_args.state_item_lens or []
@@ -2918,7 +2935,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
         dst_state_layer_ids = dst_state_layer_ids or []
 
-        handles = []
         for i, st in enumerate(state_types):
             src_indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
@@ -2970,7 +2986,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_lens,
                         dst_dims,
                         dst_gpu_id,
-                        comp_notif,
+                        "",
                         decode_tp_size,
                         decode_tp_rank,
                         src_conv,
@@ -2987,7 +3003,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_ptrs,
                         dst_indices,
                         dst_gpu_id,
-                        comp_notif,
+                        "",
                         src_layer_ids=src_lids,
                         dst_layer_ids=dst_lids,
                     )
@@ -3001,7 +3017,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     list(src_indices),
                     list(dst_indices),
                     dst_gpu_id,
-                    comp_notif,
+                    "",
                 )
             elif st == StateType.DSA:
                 if len(src_indices) != len(dst_indices):
@@ -3018,6 +3034,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                    wire_notif="",
                     state_type=st,
                     force_flat=True,
                 )
@@ -3054,6 +3071,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                    wire_notif="",
                     state_type=st,
                     force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
                     src_layer_ids=src_lids,
@@ -3085,6 +3103,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                    wire_notif="",
                     force_flat=True,
                 )
             else:
@@ -3092,8 +3111,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     f"PD Disaggregation via NIXL does NOT support {st} hybrid models yet."
                 )
             if h is not None:
-                handles.append(h)
-        return handles
+                yield h
 
     def add_transfer_request(
         self,
