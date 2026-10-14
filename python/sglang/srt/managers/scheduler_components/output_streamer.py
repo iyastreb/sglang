@@ -31,6 +31,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability import perf_trace
 from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
@@ -210,6 +211,17 @@ class SchedulerOutputStreamer:
             is_idle_batch=is_idle_batch,
         )
         if payload is not None:
+            if perf_trace.ENABLED:
+                for req in acc.output_reqs:
+                    if not getattr(req, "_perf_first_output_sent", False):
+                        req._perf_first_output_sent = True
+                        perf_trace.emit(
+                            "sched.first_output_send",
+                            rid=req.rid,
+                            room=req.bootstrap_room,
+                            output_tokens=len(req.output_ids),
+                            finished=req.finished(),
+                        )
             if self.rust_server is not None:
                 self.rust_server.push_generation(payload)
             else:

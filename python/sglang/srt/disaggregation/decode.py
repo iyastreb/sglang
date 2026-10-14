@@ -3197,6 +3197,16 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        if perf_trace.ENABLED:
+            for req in can_run_list:
+                perf_trace.emit(
+                    "dec.admitted",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    running=curr_batch_size,
+                    admitted=len(can_run_list),
+                    waiting=len(self.waiting_queue),
+                )
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

@@ -7,12 +7,14 @@ Wall time locates events; monotonic time measures intervals on the same host.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
 import socket
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
@@ -24,6 +26,7 @@ _lock = threading.Lock()
 _state = {"pid": None, "fd": None, "role": "unknown", "rank": -1}
 _host = socket.gethostname()
 _failed = False
+_gc_pauses = deque(maxlen=4096)
 _sched_getcpu = None
 if ENABLED:
     try:
@@ -75,7 +78,7 @@ def _fd() -> int:
     pid = os.getpid()
     if _state["pid"] != pid:
         directory = envs.SGLANG_PERF_TRACE_DIR.get() or os.path.join(
-            os.environ.get("LOG_DIR", "/tmp"), "profile"
+            os.environ.get("LOG_DIR", "/opt/sglang-perf"), "profile"
         )
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, f"perf-{_host}-{pid}.jsonl")
@@ -97,6 +100,7 @@ def _emit(event: str, **fields) -> None:
         "ev": event,
         "t": time.time(),
         "mono_ns": time.monotonic_ns(),
+        "thread_cpu_ns": time.thread_time_ns(),
         "host": _host,
         "pid": os.getpid(),
         "role": _state["role"],
@@ -105,6 +109,13 @@ def _emit(event: str, **fields) -> None:
         "cpu": _cpu_id(),
     }
     record.update(fields)
+    if event != "gc.pause":
+        while True:
+            try:
+                pause = _gc_pauses.popleft()
+            except IndexError:
+                break
+            _emit("gc.pause", **pause)
     try:
         line = (json.dumps(record, separators=(",", ":"), default=_default) + "\n").encode()
         with _lock:
@@ -121,6 +132,32 @@ def _emit(event: str, **fields) -> None:
 
 if ENABLED:
     emit = _emit
+    _gc_starts = {}
+
+    def _gc_trace(phase, info):
+        generation = info["generation"]
+        if phase == "start":
+            _gc_starts[generation] = time.monotonic_ns()
+        elif phase == "stop":
+            start = _gc_starts.pop(generation, None)
+            if start is not None:
+                end = time.monotonic_ns()
+                _gc_pauses.append(
+                    {
+                        "t": time.time(),
+                        "mono_ns": end,
+                        "thread_cpu_ns": time.thread_time_ns(),
+                        "tid": threading.get_native_id(),
+                        "cpu": _cpu_id(),
+                        "start_mono_ns": start,
+                        "duration_ns": end - start,
+                        "generation": generation,
+                        "collected": info["collected"],
+                        "uncollectable": info["uncollectable"],
+                    }
+                )
+
+    gc.callbacks.append(_gc_trace)
 else:
 
     def emit(event: str, **fields) -> None:

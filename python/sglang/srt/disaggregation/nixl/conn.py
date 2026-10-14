@@ -1523,6 +1523,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         last=kv_chunk.is_last_chunk,
                         pages=len(kv_chunk.prefill_kv_indices),
                         handles=len(handles),
+                        handle_ids=[handle._handle for handle in handles],
                         settled=settled,
                         failed=any_failed,
                         post_ms=(await_start - dequeue_time) * 1e3,
@@ -1795,6 +1796,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 perf_trace.emit(
                     "xfer.posted",
                     notif=notif,
+                    handle=xfer_handle._handle,
                     n_idx=len(src_indices),
                     index_ms=(make_start - index_start) * 1e3,
                     descriptor_scope="prepared_input_indices",
@@ -1963,6 +1965,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             perf_trace.emit(
                 "xfer.generic_posted",
                 notif=notif,
+                handle=xfer_handle._handle,
                 state_type=state_type,
                 n_idx=len(prefill_data_indices),
                 input_n_desc=len(src_reqs),
