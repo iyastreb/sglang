@@ -8,6 +8,7 @@ Wall time locates events; monotonic time measures intervals on the same host.
 from __future__ import annotations
 
 import gc
+import functools
 import json
 import logging
 import os
@@ -21,6 +22,9 @@ import numpy as np
 from sglang.srt.environ import envs
 
 ENABLED = envs.SGLANG_PERF_TRACE.get()
+DIRECT_ENABLED = ENABLED and os.environ.get("SGLANG_DFW_PROFILE_CONTROL") == "direct-spans"
+_direct_owner = None
+_direct_iteration = 0
 
 _lock = threading.Lock()
 _state = {"pid": None, "fd": None, "role": "unknown", "rank": -1}
@@ -55,6 +59,66 @@ def set_role(role: str, rank: int = -1) -> None:
     _state["rank"] = rank
 
 
+def _profile_records(batch):
+    return [dict(rid=req.rid, room=req.bootstrap_room,
+                 input_len=len(req.origin_input_ids), prefix_len=len(req.prefix_indices),
+                 host_hit=req.host_hit_length, host_loaded=req.host_loaded_length)
+            for req in batch.reqs]
+
+
+def _profile_eligible(records, page_size):
+    return records and all(
+        r["input_len"] >= 10000 and r["prefix_len"] >= 9984
+        and r["prefix_len"] == (r["input_len"] - 1) // page_size * page_size
+        and not r["host_hit"] and not r["host_loaded"] for r in records
+    )
+
+
+def direct_begin():
+    if DIRECT_ENABLED and _direct_owner == threading.get_ident():
+        return time.monotonic_ns(), time.thread_time_ns(), _direct_iteration
+    return None
+
+
+def direct_end(mark, event, **fields):
+    if mark is None:
+        return
+    end_ns, end_cpu_ns = time.monotonic_ns(), time.thread_time_ns()
+    emit(event, start_mono_ns=mark[0], end_mono_ns=end_ns,
+         duration_ns=end_ns-mark[0], cpu_duration_ns=end_cpu_ns-mark[1],
+         iteration=mark[2], **fields)
+
+
+def direct_span(event, request_arg=None, batch_arg=None, result_batch=False):
+    def decorate(function):
+        if not DIRECT_ENABLED:
+            return function
+
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            mark = direct_begin()
+            if mark is None:
+                return function(*args, **kwargs)
+            fields = {}
+            if request_arg is not None:
+                req = args[request_arg]
+                fields = dict(rid=req.rid, room=req.bootstrap_room)
+            if batch_arg is not None:
+                fields = dict(rooms=[r.bootstrap_room for r in args[batch_arg].reqs])
+            result = None
+            try:
+                result = function(*args, **kwargs)
+                return result
+            finally:
+                if result_batch:
+                    batch = result.batch_to_run if result is not None else None
+                    fields["rooms"] = [r.bootstrap_room for r in batch.reqs] if batch else []
+                direct_end(mark, event, **fields)
+
+        return wrapped
+    return decorate
+
+
 class _BoundedCPUProfile:
     def __init__(self):
         self.profiler = None
@@ -78,26 +142,9 @@ class _BoundedCPUProfile:
     def observe_batch(self, batch, page_size):
         if self.finished or not batch.reqs:
             return
-        records = [
-            dict(
-                rid=req.rid,
-                room=req.bootstrap_room,
-                input_len=len(req.origin_input_ids),
-                prefix_len=len(req.prefix_indices),
-                host_hit=req.host_hit_length,
-                host_loaded=req.host_loaded_length,
-            )
-            for req in batch.reqs
-        ]
+        records = _profile_records(batch)
         if self.profiler is None:
-            if not all(
-                r["input_len"] >= 10000
-                and r["prefix_len"] >= 9984
-                and r["prefix_len"] == (r["input_len"] - 1) // page_size * page_size
-                and not r["host_hit"]
-                and not r["host_loaded"]
-                for r in records
-            ):
+            if not _profile_eligible(records, page_size):
                 return
             import cProfile
 
@@ -173,7 +220,47 @@ class _BoundedCPUProfile:
         self.finished = True
 
 
+class _BoundedDirectSpans(_BoundedCPUProfile):
+    def tick(self):
+        global _direct_iteration
+        super().tick()
+        _direct_iteration = self.iterations
+
+    def observe_batch(self, batch, page_size):
+        global _direct_owner, _direct_iteration
+        if self.finished or not batch.reqs:
+            return
+        records = _profile_records(batch)
+        if self.profiler is None:
+            if not _profile_eligible(records, page_size):
+                return
+            self.profiler = True
+            self.start_ns, self.start_cpu_ns = time.monotonic_ns(), time.thread_time_ns()
+            self.iterations = _direct_iteration = 1
+            _direct_owner = threading.get_ident()
+            emit("pf.direct_start", rooms=[r["room"] for r in records],
+                 start_mono_ns=self.start_ns, owner_native_tid=threading.get_native_id())
+        self.batches.append(dict(iteration=self.iterations, requests=records))
+
+    def finish(self, reason):
+        global _direct_owner
+        if self.profiler is None:
+            return
+        end_ns, end_cpu_ns = time.monotonic_ns(), time.thread_time_ns()
+        _direct_owner = None
+        emit("pf.direct_done", start_mono_ns=self.start_ns, end_mono_ns=end_ns,
+             duration_ns=end_ns-self.start_ns, cpu_duration_ns=end_cpu_ns-self.start_cpu_ns,
+             iterations=self.iterations, stop_reason=reason, batches=self.batches,
+             iteration_limit=8, wall_limit_ns=1_000_000_000,
+             first_iteration="after batch selection, before dispatch",
+             deadline_check="scheduler iteration boundary")
+        self.profiler = None
+        self.finished = True
+
+
 def bounded_cpu_profile():
+    if DIRECT_ENABLED:
+        return _BoundedDirectSpans()
     if ENABLED and os.environ.get("SGLANG_DFW_PROFILE_CONTROL") == "cpu-profile":
         return _BoundedCPUProfile()
     return None

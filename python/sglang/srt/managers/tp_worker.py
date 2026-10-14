@@ -646,12 +646,17 @@ class TpModelWorker(BaseTpWorker):
         if self.pp_group.is_last_rank:
             if perf_trace.ENABLED:
                 forward_start = time.perf_counter()
+                forward_span = perf_trace.direct_begin()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             if perf_trace.ENABLED:
+                perf_trace.direct_end(
+                    forward_span, "pf.model_forward",
+                    rooms=[req.bootstrap_room for req in batch.reqs] if batch else [],
+                )
                 perf_trace.emit(
                     "pf.worker",
                     rooms=[req.bootstrap_room for req in batch.reqs] if batch else [],

@@ -4799,6 +4799,7 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
+    @perf_trace.direct_span("pf.result_process", batch_arg=1)
     def process_batch_result(
         self,
         batch: ScheduleBatch,
