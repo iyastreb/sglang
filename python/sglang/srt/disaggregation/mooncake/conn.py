@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -780,14 +781,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return ret
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+    def _transfer_data(
+        self, mooncake_session_id, transfer_blocks, *, trace_room=None, trace_state=None
+    ):
         if not transfer_blocks:
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
-        return self.engine.batch_transfer_sync(
+        if perf_trace.ENABLED:
+            perf_trace.emit(
+                "xfer.descriptors",
+                room=trace_room,
+                state_type=trace_state,
+                descriptor_scope="mooncake_api_input",
+                **perf_trace.lengths_summary(lengths),
+            )
+            start = time.perf_counter()
+        ret = self.engine.batch_transfer_sync(
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
+        if perf_trace.ENABLED:
+            perf_trace.emit(
+                "xfer.mooncake_sync_done",
+                room=trace_room,
+                state_type=trace_state,
+                wait_ms=(time.perf_counter() - start) * 1e3,
+                ret=ret,
+            )
+        return ret
 
     def _state_stride_mismatch(
         self,
@@ -967,6 +988,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_ptrs: Optional[set[int]] = None,
         dst_item_lens: list[int] | None = None,
         bootstrap_room: Optional[int] = None,
+        trace_room: Optional[int] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -1108,14 +1130,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(
+                mooncake_session_id,
+                transfer_blocks,
+                trace_room=trace_room if trace_room is not None else bootstrap_room,
+                trace_state=state_type,
+            )
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            return self._transfer_data(
+                mooncake_session_id,
+                transfer_blocks,
+                trace_room=trace_room if trace_room is not None else bootstrap_room,
+                trace_state=state_type,
+            )
 
         if (
             self.enable_custom_mem_pool
@@ -1163,7 +1195,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_addr = dst_ptr + int(decode_index[0]) * item_len
                         length = item_len * len(prefill_index)
                         transfer_blocks.append((src_addr, dst_addr, length))
-                return self._transfer_data(mooncake_session_id, transfer_blocks)
+                return self._transfer_data(
+                    mooncake_session_id,
+                    transfer_blocks,
+                    trace_room=trace_room if trace_room is not None else bootstrap_room,
+                    trace_state=state_type,
+                )
 
             for start in range(
                 0,
@@ -1268,6 +1305,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        trace_room: Optional[int] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1296,6 +1334,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            trace_room=trace_room,
         )
 
     def send_kvcache_dcp(
@@ -2341,7 +2380,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.room in self.request_status
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
+                        if perf_trace.ENABLED:
+                            ready_start = time.perf_counter()
                         kv_chunk.wait_event.synchronize()
+                        if perf_trace.ENABLED:
+                            perf_trace.emit(
+                                "xfer.source_ready",
+                                room=kv_chunk.room,
+                                chunk=kv_chunk.chunk_id,
+                                slice_start=kv_chunk.index_slice.start,
+                                slice_stop=kv_chunk.index_slice.stop,
+                                wait_ms=(time.perf_counter() - ready_start) * 1e3,
+                            )
                     kv_chunk.wait_event = None
 
                 if (
@@ -2369,6 +2419,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
+                if perf_trace.ENABLED:
+                    dequeue_time = time.perf_counter()
+                    perf_trace.emit(
+                        "xfer.dequeue",
+                        room=kv_chunk.room,
+                        chunk=kv_chunk.chunk_id,
+                        slice_start=kv_chunk.index_slice.start,
+                        slice_stop=kv_chunk.index_slice.stop,
+                        pages=len(kv_chunk.prefill_kv_indices),
+                        last=kv_chunk.is_last_chunk,
+                        worker=worker_index,
+                        src_runs=perf_trace.runs(kv_chunk.prefill_kv_indices),
+                    )
                 reqs_to_be_processed = (
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
@@ -2450,6 +2513,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        if perf_trace.ENABLED:
+                            send_start = time.perf_counter()
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
@@ -2502,6 +2567,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                trace_room=kv_chunk.room,
                             )
                         elif (
                             self.enable_staging
@@ -2536,6 +2602,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                                 target_rank_registration_info.dst_kv_layer_ids,
+                            )
+                        if perf_trace.ENABLED:
+                            perf_trace.emit(
+                                "xfer.kv_done" if kv_chunk.is_last_chunk else "xfer.done",
+                                room=kv_chunk.room,
+                                chunk=kv_chunk.chunk_id,
+                                slice_start=kv_chunk.index_slice.start,
+                                slice_stop=kv_chunk.index_slice.stop,
+                                last=kv_chunk.is_last_chunk,
+                                pages=len(kv_chunk.prefill_kv_indices),
+                                post_ms=(send_start - dequeue_time) * 1e3,
+                                wait_ms=(time.perf_counter() - send_start) * 1e3,
+                                ret=ret,
+                                dst_runs=perf_trace.runs(chunked_dst_kv_indice),
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -2594,6 +2674,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            if perf_trace.ENABLED:
+                                perf_trace.emit(
+                                    "xfer.done",
+                                    room=kv_chunk.room,
+                                    chunk=kv_chunk.chunk_id,
+                                    slice_start=kv_chunk.index_slice.start,
+                                    slice_stop=kv_chunk.index_slice.stop,
+                                    last=True,
+                                    pages=len(kv_chunk.prefill_kv_indices),
+                                    post_ms=(send_start - dequeue_time) * 1e3,
+                                    wait_ms=(time.perf_counter() - send_start) * 1e3,
+                                    includes_state_aux=True,
+                                    ret=ret,
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
@@ -2872,6 +2966,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if parsed is None:
                     continue
                 room, status, prefill_rank, reason = parsed
+                if perf_trace.ENABLED:
+                    perf_trace.emit(
+                        "dec.notif", room=room, status=status, prefill_rank=prefill_rank
+                    )
                 self.apply_prefill_status(
                     bootstrap_room=room,
                     status=status,
@@ -2921,6 +3019,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        if perf_trace.ENABLED:
+            perf_trace.emit(
+                "xfer.enqueue",
+                room=bootstrap_room,
+                chunk=None,
+                slice_start=index_slice.start,
+                slice_stop=index_slice.stop,
+                pages=len(kv_indices),
+                last=is_last_chunk,
+                shard=shard_idx,
+            )
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -3277,6 +3386,13 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
         self.init_time = time.time()
+        if perf_trace.ENABLED:
+            perf_trace.emit(
+                "dec.meta_sent",
+                room=self.bootstrap_room,
+                pages=len(kv_indices),
+                dst_runs=perf_trace.runs(kv_indices),
+            )
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

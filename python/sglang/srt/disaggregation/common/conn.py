@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -562,9 +563,17 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
                 self.request_status[bootstrap_room] = status
+                if perf_trace.ENABLED:
+                    perf_trace.emit(
+                        "kv.status", room=bootstrap_room, status=status, prev=current
+                    )
             return
         if status == KVPoll.Failed:
             self.request_status[bootstrap_room] = KVPoll.Failed
+            if perf_trace.ENABLED and current != KVPoll.Failed:
+                perf_trace.emit(
+                    "kv.status", room=bootstrap_room, status=status, prev=current
+                )
             if self.deferred_bootstrap is not None:
                 self._notify_bootstrap(
                     bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
@@ -575,6 +584,8 @@ class CommonKVManager(BaseKVManager):
             # happily promote it back to Transferring or Success.
             return
         self.request_status[bootstrap_room] = max(current, status)
+        if perf_trace.ENABLED and status > current:
+            perf_trace.emit("kv.status", room=bootstrap_room, status=status, prev=current)
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:

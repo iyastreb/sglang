@@ -68,6 +68,9 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
     return value.lower() in ("true", "1")
 
 
+_PERF_TRACE_ENABLED = _get_bool_env_var("SGLANG_PERF_TRACE")
+
+
 def _create_bench_client_session():
     # When the pressure is big, the read buffer could be full before aio thread read
     # the content. We increase the read_bufsize from 64K to 10M.
@@ -108,6 +111,11 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    rid: str = ""
+    start_wall: float = 0.0
+    first_token_wall: float = 0.0
+    start_mono_ns: int = 0
+    first_token_mono_ns: int = 0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -728,6 +736,9 @@ async def async_request_sglang_generate(
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
+        if _PERF_TRACE_ENABLED:
+            output.start_wall = time.time()
+            output.start_mono_ns = time.monotonic_ns()
         most_recent_timestamp = st
         last_output_len = 0
         try:
@@ -780,6 +791,10 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    if _PERF_TRACE_ENABLED:
+                                        output.first_token_wall = time.time()
+                                        output.first_token_mono_ns = time.monotonic_ns()
+                                        output.rid = str(data["meta_info"].get("id", ""))
 
                                 # Decoding phase
                                 else:
@@ -1934,6 +1949,14 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if _PERF_TRACE_ENABLED:
+        result_details.update(
+            rids=[output.rid for output in outputs],
+            start_walls=[output.start_wall for output in outputs],
+            first_token_walls=[output.first_token_wall for output in outputs],
+            start_mono_ns=[output.start_mono_ns for output in outputs],
+            first_token_mono_ns=[output.first_token_mono_ns for output in outputs],
+        )
 
     if args.cache_report:
         result_details["cached_tokens"] = [o.cached_tokens for o in outputs]

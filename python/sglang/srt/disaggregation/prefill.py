@@ -82,6 +82,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -558,6 +559,14 @@ class PrefillBootstrapQueue:
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
+        if perf_trace.ENABLED:
+            for req in bootstrapped_reqs:
+                perf_trace.emit(
+                    "pf.bootstrapped",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    pending=req.pending_bootstrap,
+                )
         if return_failed_reqs is False:
             return bootstrapped_reqs
         else:
@@ -682,6 +691,19 @@ class SchedulerDisaggregationPrefillMixin:
 
         if batch:
             set_schedule_time_batch(batch)
+        if batch and perf_trace.ENABLED:
+            for req in batch.reqs:
+                rng = req.extend_range
+                perf_trace.emit(
+                    "pf.forward_start",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    prefix_len=len(req.prefix_indices),
+                    extend_len=(rng.end - rng.start) if rng is not None else None,
+                    host_hit=req.host_hit_length,
+                    host_loaded=req.host_loaded_length,
+                    bs=len(batch.reqs),
+                )
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
@@ -906,7 +928,15 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if copy_done is not None:
+            if perf_trace.ENABLED:
+                wait_start = time.perf_counter()
             copy_done.synchronize()
+            if perf_trace.ENABLED:
+                perf_trace.emit(
+                    "pf.result_wait",
+                    rooms=[req.bootstrap_room for req in batch.reqs],
+                    wait_ms=(time.perf_counter() - wait_start) * 1e3,
+                )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -957,6 +987,8 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                if perf_trace.ENABLED:
+                    perf_trace.emit("pf.forward_done", rid=req.rid, room=req.bootstrap_room)
 
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
@@ -1183,6 +1215,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # todo: set Transferring correctly in backend
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
+                if perf_trace.ENABLED:
+                    perf_trace.emit(
+                        "pf.transfer_success", rid=req.rid, room=req.bootstrap_room
+                    )
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
@@ -1623,9 +1659,34 @@ class SchedulerDisaggregationPrefillMixin:
                         prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
-            state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            if perf_trace.ENABLED:
+                state_start = time.perf_counter()
+                state_indices = []
+                components = []
+                for st in state_types:
+                    component_start = time.perf_counter()
+                    indices = payloads[st]() if st in payloads else None
+                    component_ms = (time.perf_counter() - component_start) * 1e3
+                    state_indices.append(indices)
+                    components.append(
+                        {
+                            "type": st,
+                            "indices": len(indices) if indices is not None else 0,
+                            "ms": component_ms,
+                        }
+                    )
+                perf_trace.emit(
+                    "pf.state_indices",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    seq_len=seq_len,
+                    ms=(time.perf_counter() - state_start) * 1e3,
+                    components=components,
+                )
+            else:
+                state_indices = [
+                    payloads[st]() if st in payloads else None for st in state_types
+                ]
 
         transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
         if self.enable_staging:
@@ -1665,6 +1726,16 @@ class SchedulerDisaggregationPrefillMixin:
             ):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            if perf_trace.ENABLED:
+                perf_trace.emit(
+                    "pf.send_chunk",
+                    rid=req.rid,
+                    room=req.bootstrap_room,
+                    start=seg_start,
+                    end=seg_end,
+                    pages=len(page_indices),
+                    last=segment_is_last,
+                )
             req.disagg_kv_sender.send(
                 page_indices,
                 send_state_indices,

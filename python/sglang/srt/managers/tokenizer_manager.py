@@ -121,6 +121,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -754,6 +755,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_disaggregation(self, *, start_pd_bootstrap_service: bool = True):
         # PD Disaggregation
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        if perf_trace.ENABLED:
+            perf_trace.set_role(f"tokenizer-{self.disaggregation_mode.value}")
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
             start_disagg_service() if start_pd_bootstrap_service else None
@@ -888,6 +891,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        if perf_trace.ENABLED and obj.is_single and isinstance(obj, GenerateReqInput):
+            perf_trace.emit(
+                "tm.recv",
+                rid=obj.rid,
+                room=obj.bootstrap_room,
+                received_time=obj.received_time,
+                http_t0=(
+                    request.scope.get("perf_t0")
+                    if isinstance(request, fastapi.Request)
+                    else None
+                ),
+                http_mono_ns=(
+                    request.scope.get("perf_mono_ns")
+                    if isinstance(request, fastapi.Request)
+                    else None
+                ),
+                text_len=len(obj.text) if isinstance(obj.text, str) else None,
+            )
         request_states = {
             rid: self.rid_to_state[rid]
             for rid in ([obj.rid] if obj.is_single else obj.rid)
@@ -908,10 +929,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Tokenize the request and send it to the scheduler
                 if obj.is_single:
                     tokenized_obj = await self._tokenize_one_request(obj)
+                    if perf_trace.ENABLED:
+                        perf_trace.emit(
+                            "tm.tokenized",
+                            rid=obj.rid,
+                            num_tokens=len(tokenized_obj.input_ids),
+                        )
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    if perf_trace.ENABLED:
+                        perf_trace.emit("tm.dispatched", rid=obj.rid)
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -2621,6 +2650,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             first_output_time = None
             if state.time_stats.first_token_time == 0.0:
                 first_output_time = time.perf_counter()
+                if perf_trace.ENABLED:
+                    perf_trace.emit("tm.first_out", rid=rid, finished=state.finished)
                 state.time_stats.set_first_token_time(
                     ts=self._get_scheduler_first_token_time(state, recv_obj, i)
                     or first_output_time

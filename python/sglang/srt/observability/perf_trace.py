@@ -1,0 +1,105 @@
+"""Per-request timeline probes for PD-disaggregation profiling.
+
+Enabled by SGLANG_PERF_TRACE=1. Each process appends JSON lines to
+<SGLANG_PERF_TRACE_DIR or $LOG_DIR/profile>/perf-<host>-<pid>.jsonl.
+Wall time locates events; monotonic time measures intervals on the same host.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import socket
+import threading
+import time
+
+import numpy as np
+
+from sglang.srt.environ import envs
+
+ENABLED = envs.SGLANG_PERF_TRACE.get()
+
+_lock = threading.Lock()
+_state = {"pid": None, "fd": None, "role": "unknown", "rank": -1}
+_host = socket.gethostname()
+_failed = False
+
+
+def set_role(role: str, rank: int = -1) -> None:
+    _state["role"] = role
+    _state["rank"] = rank
+
+
+def runs(indices) -> int:
+    """Number of contiguous index runs; 1 means fully contiguous."""
+    arr = np.asarray(indices)
+    if arr.ndim != 1 or arr.size <= 1:
+        return int(arr.size)
+    return int(np.count_nonzero(np.diff(arr) != 1) + 1)
+
+
+def lengths_summary(lengths) -> dict:
+    values = np.asarray(lengths, dtype=np.uint64)
+    sizes, counts = np.unique(values, return_counts=True)
+    return {
+        "n_desc": int(values.size),
+        "bytes": int(values.sum()),
+        "length_hist": [[int(n), int(c)] for n, c in zip(sizes[:64], counts[:64])],
+        "length_hist_truncated": len(sizes) > 64,
+    }
+
+
+def _fd() -> int:
+    pid = os.getpid()
+    if _state["pid"] != pid:
+        directory = envs.SGLANG_PERF_TRACE_DIR.get() or os.path.join(
+            os.environ.get("LOG_DIR", "/tmp"), "profile"
+        )
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"perf-{_host}-{pid}.jsonl")
+        _state["fd"] = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        _state["pid"] = pid
+    return _state["fd"]
+
+
+def _default(obj):
+    item = getattr(obj, "item", None)
+    return item() if callable(item) else str(obj)
+
+
+def _emit(event: str, **fields) -> None:
+    global _failed
+    if _failed:
+        return
+    record = {
+        "ev": event,
+        "t": time.time(),
+        "mono_ns": time.monotonic_ns(),
+        "host": _host,
+        "pid": os.getpid(),
+        "role": _state["role"],
+        "rank": _state["rank"],
+        "tid": threading.get_native_id(),
+    }
+    record.update(fields)
+    try:
+        line = (json.dumps(record, separators=(",", ":"), default=_default) + "\n").encode()
+        with _lock:
+            fd = _fd()
+            while line:
+                written = os.write(fd, line)
+                if written <= 0:
+                    raise OSError("perf trace write made no progress")
+                line = line[written:]
+    except Exception:
+        _failed = True
+        logging.getLogger(__name__).exception("Disabling failed perf trace writer")
+
+
+if ENABLED:
+    emit = _emit
+else:
+
+    def emit(event: str, **fields) -> None:
+        return None
