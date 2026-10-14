@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import numpy as np
@@ -70,9 +71,72 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
 
 
 _PERF_TRACE_ENABLED = _get_bool_env_var("SGLANG_PERF_TRACE")
+_DFW_PROFILE_CONTROL = os.getenv("SGLANG_DFW_PROFILE_CONTROL", "")
 
 
-def _create_bench_client_session():
+class _ClientPerfTrace:
+    def __init__(self):
+        self.events = []
+        self.first_body = True
+        self.config = aiohttp.TraceConfig()
+        for signal, event in (
+            ("on_request_start", "request.start"),
+            ("on_connection_queued_start", "connection.queued_start"),
+            ("on_connection_queued_end", "connection.queued_end"),
+            ("on_connection_create_start", "connection.create_start"),
+            ("on_connection_create_end", "connection.create_end"),
+            ("on_connection_reuseconn", "connection.reused"),
+            ("on_dns_cache_hit", "dns.cache_hit"),
+            ("on_dns_cache_miss", "dns.cache_miss"),
+            ("on_dns_resolvehost_start", "dns.start"),
+            ("on_dns_resolvehost_end", "dns.end"),
+            ("on_request_headers_sent", "request.headers_sent"),
+            ("on_request_chunk_sent", "request.body_chunk_sent"),
+            ("on_request_end", "response.headers_received"),
+            ("on_request_exception", "request.exception"),
+        ):
+            async def callback(session, context, params, name=event):
+                fields = {}
+                if hasattr(params, "host"):
+                    fields["host"] = params.host
+                if hasattr(params, "chunk"):
+                    fields["bytes"] = len(params.chunk)
+                if hasattr(params, "response"):
+                    fields["status"] = params.response.status
+                if hasattr(params, "exception"):
+                    fields["exception_type"] = type(params.exception).__name__
+                self.mark(name, **fields)
+
+            getattr(self.config, signal).append(callback)
+
+    def mark(self, event, **fields):
+        record = dict(
+            ev=event,
+            mono_ns=time.monotonic_ns(),
+            thread_cpu_ns=time.thread_time_ns(),
+        )
+        record.update(fields)
+        self.events.append(record)
+
+    def dumps(self, payload):
+        start = time.monotonic_ns()
+        cpu_start = time.thread_time_ns()
+        encoded = json.dumps(payload)
+        end = time.monotonic_ns()
+        cpu_end = time.thread_time_ns()
+        self.mark(
+            "json.serialize",
+            mono_ns=end,
+            start_mono_ns=start,
+            duration_ns=end - start,
+            thread_cpu_ns=cpu_end,
+            cpu_duration_ns=cpu_end - cpu_start,
+            characters=len(encoded),
+        )
+        return encoded
+
+
+def _create_bench_client_session(perf_trace=None):
     # When the pressure is big, the read buffer could be full before aio thread read
     # the content. We increase the read_bufsize from 64K to 10M.
     # Define constants for timeout and buffer size for clarity and maintainability
@@ -80,8 +144,15 @@ def _create_bench_client_session():
     BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
 
     aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
+    trace_kwargs = (
+        dict(trace_configs=[perf_trace.config], json_serialize=perf_trace.dumps)
+        if perf_trace is not None
+        else {}
+    )
     return aiohttp.ClientSession(
-        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
+        timeout=aiohttp_timeout,
+        read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES,
+        **trace_kwargs,
     )
 
 
@@ -118,6 +189,7 @@ class RequestFuncOutput:
     start_mono_ns: int = 0
     first_token_mono_ns: int = 0
     first_token_completion_tokens: int = 0
+    client_trace: List[Dict[str, Any]] = field(default_factory=list)
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -700,7 +772,8 @@ async def async_request_sglang_generate(
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
 
-    async with _create_bench_client_session() as session:
+    perf_trace = _ClientPerfTrace() if _PERF_TRACE_ENABLED else None
+    async with _create_bench_client_session(perf_trace) as session:
         sampling_params = {
             "temperature": args.temperature,
             "max_new_tokens": request_func_input.output_len,
@@ -732,6 +805,8 @@ async def async_request_sglang_generate(
             headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
+        if perf_trace is not None:
+            output.client_trace = perf_trace.events
 
         generated_text = ""
         output_len = request_func_input.output_len
@@ -741,6 +816,7 @@ async def async_request_sglang_generate(
         if _PERF_TRACE_ENABLED:
             output.start_wall = time.time()
             output.start_mono_ns = time.monotonic_ns()
+            perf_trace.mark("client.start", mono_ns=output.start_mono_ns)
         most_recent_timestamp = st
         last_output_len = 0
         try:
@@ -749,6 +825,11 @@ async def async_request_sglang_generate(
             ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
+                        if perf_trace is not None and perf_trace.first_body:
+                            perf_trace.first_body = False
+                            perf_trace.mark(
+                                "response.first_body_chunk_consumed", bytes=len(chunk_bytes)
+                            )
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
                             continue
@@ -798,6 +879,12 @@ async def async_request_sglang_generate(
                                         output.first_token_mono_ns = time.monotonic_ns()
                                         output.rid = str(data["meta_info"].get("id", ""))
                                         output.first_token_completion_tokens = output_len
+                                        perf_trace.mark(
+                                            "client.first_visible_text",
+                                            mono_ns=output.first_token_mono_ns,
+                                            rid=output.rid,
+                                            completion_tokens=output_len,
+                                        )
 
                                 # Decoding phase
                                 else:
@@ -1963,6 +2050,14 @@ async def benchmark(
             first_token_completion_tokens=[
                 output.first_token_completion_tokens for output in outputs
             ],
+            client_traces=[output.client_trace for output in outputs],
+            perf_aiohttp_version=aiohttp.__version__,
+        )
+    if _DFW_PROFILE_CONTROL in ("client-ip", "client-warmup", "client-ip-warmup"):
+        result_details["dfw_client_control"] = dict(
+            mode=_DFW_PROFILE_CONTROL,
+            base_url=base_url,
+            warmup_requests=warmup_requests,
         )
 
     if args.cache_report:
@@ -2008,6 +2103,8 @@ def run_benchmark(args_: argparse.Namespace):
     # Set default value for warmup_requests if not present
     if not hasattr(args, "warmup_requests"):
         args.warmup_requests = 1
+    if _DFW_PROFILE_CONTROL in ("client-warmup", "client-ip-warmup"):
+        args.warmup_requests = 16
 
     if not hasattr(args, "output_details"):
         args.output_details = False
@@ -2097,6 +2194,18 @@ def run_benchmark(args_: argparse.Namespace):
     # Base URL the client sends to: --base-url if given, else http://host:port
     # (IPv6-correct). gserver uses the scheme-less host:port form instead.
     base_url = resolve_base_url(args.base_url, args.host, args.port)
+    if _DFW_PROFILE_CONTROL in ("client-ip", "client-ip-warmup"):
+        parsed = urlsplit(base_url)
+        if parsed.scheme != "http" or not parsed.hostname:
+            raise ValueError("DFW client-IP control requires an HTTP base URL")
+        addresses = socket.getaddrinfo(
+            parsed.hostname, parsed.port or 80, type=socket.SOCK_STREAM
+        )
+        address = addresses[0][4][0]
+        host = f"[{address}]" if ":" in address else address
+        netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+        base_url = urlunsplit(parsed._replace(netloc=netloc))
+        print(f"DFW client-IP control: {parsed.hostname} -> {address}")
 
     model_url = f"{base_url}/v1/models"
 
