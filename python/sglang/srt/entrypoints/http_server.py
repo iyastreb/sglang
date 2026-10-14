@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import socket
 import ssl
 import tempfile
 import threading
@@ -497,7 +498,11 @@ if perf_trace.ENABLED:
             if scope["type"] == "http":
                 if scope["method"] == "GET" and scope["path"] == "/_perf_clock":
                     response = ORJSONResponse(
-                        {"wall_ns": time.time_ns(), "mono_ns": time.monotonic_ns()}
+                        {
+                            "host": socket.gethostname(),
+                            "wall_ns": time.time_ns(),
+                            "mono_ns": time.monotonic_ns(),
+                        }
                     )
                     await response(scope, receive, send)
                     return
