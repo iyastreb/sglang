@@ -100,7 +100,7 @@ class _BoundedCPUProfile:
                 return
             import cProfile
 
-            self.profiler = cProfile.Profile(timer=time.thread_time)
+            self.profiler = cProfile.Profile()
             self.start_ns = time.monotonic_ns()
             self.start_cpu_ns = time.thread_time_ns()
             self.iterations = 1
@@ -128,7 +128,8 @@ class _BoundedCPUProfile:
             host=_host,
             pid=os.getpid(),
             rank=_state["rank"],
-            timer="time.thread_time",
+            timer="cProfile default monotonic wall clock",
+            time_scope="scheduler call wall time including waits; separate scheduler thread CPU envelope",
             start_mono_ns=self.start_ns,
             end_mono_ns=end_ns,
             thread_cpu_ns=end_cpu_ns - self.start_cpu_ns,
