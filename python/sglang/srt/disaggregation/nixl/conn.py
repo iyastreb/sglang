@@ -1797,7 +1797,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     n_idx=len(src_indices),
                     index_ms=(make_start - index_start) * 1e3,
                     descriptor_scope="prepared_input_indices",
-                    bytes=sum(int(n) for n in item_lens) * len(prefill_data_indices),
+                    **perf_trace.lengths_summary(item_lens, len(prefill_data_indices)),
                     make_ms=(post_start - make_start) * 1e3,
                     post_ms=(time.perf_counter() - post_start) * 1e3,
                     src_runs=perf_trace.runs(prefill_data_indices),

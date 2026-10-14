@@ -60,13 +60,13 @@ def runs(indices) -> int:
     return int(np.count_nonzero(np.diff(arr) != 1) + 1)
 
 
-def lengths_summary(lengths) -> dict:
+def lengths_summary(lengths, repeats: int = 1) -> dict:
     values = np.asarray(lengths, dtype=np.uint64)
     sizes, counts = np.unique(values, return_counts=True)
     return {
-        "n_desc": int(values.size),
-        "bytes": int(values.sum()),
-        "length_hist": [[int(n), int(c)] for n, c in zip(sizes[:64], counts[:64])],
+        "n_desc": int(values.size) * repeats,
+        "bytes": int(values.sum()) * repeats,
+        "length_hist": [[int(n), int(c) * repeats] for n, c in zip(sizes[:64], counts[:64])],
         "length_hist_truncated": len(sizes) > 64,
     }
 
