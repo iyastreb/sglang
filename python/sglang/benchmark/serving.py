@@ -21,6 +21,7 @@ import math
 import os
 import random
 import shutil
+import socket
 import sys
 import time
 import traceback
@@ -1951,6 +1952,7 @@ async def benchmark(
     }
     if _PERF_TRACE_ENABLED:
         result_details.update(
+            perf_client_host=socket.gethostname(),
             rids=[output.rid for output in outputs],
             start_walls=[output.start_wall for output in outputs],
             first_token_walls=[output.first_token_wall for output in outputs],
