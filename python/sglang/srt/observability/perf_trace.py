@@ -24,6 +24,27 @@ _lock = threading.Lock()
 _state = {"pid": None, "fd": None, "role": "unknown", "rank": -1}
 _host = socket.gethostname()
 _failed = False
+_sched_getcpu = None
+if ENABLED:
+    try:
+        import ctypes
+
+        _libc = ctypes.PyDLL(None)  # Keep the GIL for this nonblocking probe.
+        _sched_getcpu = _libc.sched_getcpu
+        _sched_getcpu.argtypes = []
+        _sched_getcpu.restype = ctypes.c_int
+    except Exception:
+        _sched_getcpu = None
+
+
+def _cpu_id() -> int | None:
+    if _sched_getcpu is None:
+        return None
+    try:
+        cpu = _sched_getcpu()
+        return cpu if cpu >= 0 else None
+    except Exception:
+        return None
 
 
 def set_role(role: str, rank: int = -1) -> None:
@@ -81,6 +102,7 @@ def _emit(event: str, **fields) -> None:
         "role": _state["role"],
         "rank": _state["rank"],
         "tid": threading.get_native_id(),
+        "cpu": _cpu_id(),
     }
     record.update(fields)
     try:
