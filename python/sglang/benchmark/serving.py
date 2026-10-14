@@ -15,6 +15,7 @@ python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num
 import argparse
 import asyncio
 import copy
+import gc
 import importlib.util
 import json
 import math
@@ -23,11 +24,13 @@ import random
 import shutil
 import socket
 import sys
+import threading
 import time
 import traceback
 import uuid
 import warnings
 from argparse import ArgumentParser
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -72,6 +75,56 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
 
 _PERF_TRACE_ENABLED = _get_bool_env_var("SGLANG_PERF_TRACE")
 _DFW_PROFILE_CONTROL = os.getenv("SGLANG_DFW_PROFILE_CONTROL", "")
+_CLIENT_GC_PAUSES = deque(maxlen=4096)
+_CLIENT_GC_STARTS = {}
+_CLIENT_GC_DROPPED = 0
+
+
+def _client_gc_state():
+    return dict(
+        mono_ns=time.monotonic_ns(),
+        enabled=gc.isenabled(),
+        thresholds=gc.get_threshold(),
+        counts=gc.get_count(),
+        freeze_count=gc.get_freeze_count(),
+    )
+
+
+def _client_gc_trace(phase, info):
+    global _CLIENT_GC_DROPPED
+    tid = threading.get_native_id()
+    key = (tid, info["generation"])
+    if phase == "start":
+        _CLIENT_GC_STARTS[key] = (
+            time.monotonic_ns(), time.time_ns(), time.thread_time_ns()
+        )
+    elif phase == "stop":
+        start = _CLIENT_GC_STARTS.pop(key, None)
+        if start is None:
+            return
+        end_ns, end_cpu_ns = time.monotonic_ns(), time.thread_time_ns()
+        if len(_CLIENT_GC_PAUSES) == _CLIENT_GC_PAUSES.maxlen:
+            _CLIENT_GC_DROPPED += 1
+        _CLIENT_GC_PAUSES.append(
+            dict(
+                start_mono_ns=start[0],
+                end_mono_ns=end_ns,
+                start_wall_ns=start[1],
+                end_wall_ns=time.time_ns(),
+                duration_ns=end_ns - start[0],
+                start_thread_cpu_ns=start[2],
+                end_thread_cpu_ns=end_cpu_ns,
+                cpu_duration_ns=end_cpu_ns - start[2],
+                native_tid=tid,
+                generation=info["generation"],
+                collected=info["collected"],
+                uncollectable=info["uncollectable"],
+            )
+        )
+
+
+if _PERF_TRACE_ENABLED:
+    gc.callbacks.append(_client_gc_trace)
 
 
 class _ClientPerfTrace:
@@ -1504,6 +1557,7 @@ async def benchmark(
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
 ):
+    client_gc_before_warmup = _client_gc_state() if _PERF_TRACE_ENABLED else None
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -1647,6 +1701,7 @@ async def benchmark(
                 print("Profiler started")
 
     # Run all requests
+    client_gc_before_measured = _client_gc_state() if _PERF_TRACE_ENABLED else None
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
@@ -2052,6 +2107,15 @@ async def benchmark(
             ],
             client_traces=[output.client_trace for output in outputs],
             perf_aiohttp_version=aiohttp.__version__,
+            perf_client_pid=os.getpid(),
+            perf_client_native_tid=threading.get_native_id(),
+            perf_client_main_native_tid=threading.main_thread().native_id,
+            perf_client_event_loop=type(asyncio.get_running_loop()).__qualname__,
+            client_gc_before_warmup=client_gc_before_warmup,
+            client_gc_before_measured=client_gc_before_measured,
+            client_gc_after_measured=_client_gc_state(),
+            client_gc_pauses=list(_CLIENT_GC_PAUSES),
+            client_gc_dropped=_CLIENT_GC_DROPPED,
         )
     if _DFW_PROFILE_CONTROL in ("client-ip", "client-warmup", "client-ip-warmup"):
         result_details["dfw_client_control"] = dict(
