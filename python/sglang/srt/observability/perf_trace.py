@@ -63,6 +63,7 @@ class _BoundedCPUProfile:
         self.batches = []
         self.start_ns = 0
         self.start_cpu_ns = 0
+        self.ignored_callbacks = 0
 
     def tick(self):
         if self.profiler is None:
@@ -101,6 +102,24 @@ class _BoundedCPUProfile:
             import cProfile
 
             self.profiler = cProfile.Profile()
+            owner_thread = threading.get_ident()
+            self.owner_native_tid = threading.get_native_id()
+
+            def scheduler_only(callback):
+                def filtered(*args):
+                    if threading.get_ident() == owner_thread:
+                        return callback(*args)
+                    self.ignored_callbacks += 1
+
+                return filtered
+
+            for name in (
+                "_pystart_callback",
+                "_pyreturn_callback",
+                "_ccall_callback",
+                "_creturn_callback",
+            ):
+                setattr(self.profiler, name, scheduler_only(getattr(self.profiler, name)))
             self.start_ns = time.monotonic_ns()
             self.start_cpu_ns = time.thread_time_ns()
             self.iterations = 1
@@ -130,6 +149,9 @@ class _BoundedCPUProfile:
             rank=_state["rank"],
             timer="cProfile default monotonic wall clock",
             time_scope="scheduler call wall time including waits; separate scheduler thread CPU envelope",
+            owner_native_tid=self.owner_native_tid,
+            callback_filter="scheduler thread only",
+            ignored_other_thread_callbacks=self.ignored_callbacks,
             start_mono_ns=self.start_ns,
             end_mono_ns=end_ns,
             thread_cpu_ns=end_cpu_ns - self.start_cpu_ns,
