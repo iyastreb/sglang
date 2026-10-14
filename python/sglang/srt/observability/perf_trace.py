@@ -55,6 +55,107 @@ def set_role(role: str, rank: int = -1) -> None:
     _state["rank"] = rank
 
 
+class _BoundedCPUProfile:
+    def __init__(self):
+        self.profiler = None
+        self.finished = False
+        self.iterations = 0
+        self.batches = []
+        self.start_ns = 0
+        self.start_cpu_ns = 0
+
+    def tick(self):
+        if self.profiler is None:
+            return
+        if self.iterations >= 8:
+            self.finish("iteration_limit")
+        elif time.monotonic_ns() - self.start_ns >= 1_000_000_000:
+            self.finish("wall_limit_at_iteration_boundary")
+        else:
+            self.iterations += 1
+
+    def observe_batch(self, batch, page_size):
+        if self.finished or not batch.reqs:
+            return
+        records = [
+            dict(
+                rid=req.rid,
+                room=req.bootstrap_room,
+                input_len=len(req.origin_input_ids),
+                prefix_len=len(req.prefix_indices),
+                host_hit=req.host_hit_length,
+                host_loaded=req.host_loaded_length,
+            )
+            for req in batch.reqs
+        ]
+        if self.profiler is None:
+            if not all(
+                r["input_len"] >= 10000
+                and r["prefix_len"] >= 9984
+                and r["prefix_len"] == (r["input_len"] - 1) // page_size * page_size
+                and not r["host_hit"]
+                and not r["host_loaded"]
+                for r in records
+            ):
+                return
+            import cProfile
+
+            self.profiler = cProfile.Profile(timer=time.thread_time)
+            self.start_ns = time.monotonic_ns()
+            self.start_cpu_ns = time.thread_time_ns()
+            self.iterations = 1
+            emit("cpu_profile.start", rooms=[r["room"] for r in records])
+            self.profiler.enable()
+        self.batches.append(
+            dict(iteration=self.iterations, mono_ns=time.monotonic_ns(), requests=records)
+        )
+
+    def finish(self, reason):
+        if self.profiler is None:
+            return
+        self.profiler.disable()
+        end_ns = time.monotonic_ns()
+        end_cpu_ns = time.thread_time_ns()
+        directory = envs.SGLANG_PERF_TRACE_DIR.get() or os.path.join(
+            os.environ.get("LOG_DIR", "/opt/sglang-perf"), "profile"
+        )
+        os.makedirs(directory, exist_ok=True)
+        stem = os.path.join(
+            directory, f"cpu-prefill-{_host}-{os.getpid()}-rank{_state['rank']}"
+        )
+        self.profiler.dump_stats(stem + ".prof")
+        manifest = dict(
+            host=_host,
+            pid=os.getpid(),
+            rank=_state["rank"],
+            timer="time.thread_time",
+            start_mono_ns=self.start_ns,
+            end_mono_ns=end_ns,
+            thread_cpu_ns=end_cpu_ns - self.start_cpu_ns,
+            wall_ns=end_ns - self.start_ns,
+            iteration_limit=8,
+            wall_limit_ns=1_000_000_000,
+            deadline_check="scheduler iteration boundary",
+            iterations=self.iterations,
+            stop_reason=reason,
+            selection="input>=10000; GPU prefix>=9984 and page-aligned maximum; no host hits or loads",
+            first_iteration="starts after batch selection, before dispatch",
+            batches=self.batches,
+        )
+        with open(stem + ".json", "w") as f:
+            json.dump(manifest, f, separators=(",", ":"))
+            f.write("\n")
+        emit("cpu_profile.done", wall_ns=manifest["wall_ns"], iterations=self.iterations)
+        self.profiler = None
+        self.finished = True
+
+
+def bounded_cpu_profile():
+    if ENABLED and os.environ.get("SGLANG_DFW_PROFILE_CONTROL") == "cpu-profile":
+        return _BoundedCPUProfile()
+    return None
+
+
 def runs(indices) -> int:
     """Number of contiguous index runs; 1 means fully contiguous."""
     arr = np.asarray(indices)

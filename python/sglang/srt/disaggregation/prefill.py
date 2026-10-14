@@ -710,9 +710,12 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        cpu_profile = perf_trace.bounded_cpu_profile()
         while True:
             if self.gracefully_exit:
                 break
+            if cpu_profile is not None:
+                cpu_profile.tick()
 
             # Receive requests
             self.ingest_requests()
@@ -736,6 +739,10 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                if cpu_profile is not None:
+                    cpu_profile.observe_batch(
+                        batch, self.token_to_kv_pool_allocator.page_size
+                    )
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
@@ -748,6 +755,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+        if cpu_profile is not None:
+            cpu_profile.finish("loop_exit")
 
     def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
         """Check support once on entry to the prefill overlap loop."""
@@ -795,10 +804,13 @@ class SchedulerDisaggregationPrefillMixin:
         # Keep the newer forward's sampling context across unfinished-result passes.
         batch = None
         batch_result = None
+        cpu_profile = perf_trace.bounded_cpu_profile()
 
         while True:
             if self.gracefully_exit:
                 break
+            if cpu_profile is not None:
+                cpu_profile.tick()
 
             # Stop dispatching at pause requests while waiting for a batch result.
             received_inputs = self.ingest_requests(
@@ -839,6 +851,10 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Launch the current batch
                 if batch:
+                    if cpu_profile is not None:
+                        cpu_profile.observe_batch(
+                            batch, self.token_to_kv_pool_allocator.page_size
+                        )
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
                     batch_result = self.run_batch(batch)
@@ -877,6 +893,8 @@ class SchedulerDisaggregationPrefillMixin:
             self._sched_idled = batch is None
             self.last_batch = batch
             waiting_for_batch_result = False
+        if cpu_profile is not None:
+            cpu_profile.finish("loop_exit")
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,
