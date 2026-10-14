@@ -892,6 +892,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         if perf_trace.ENABLED and obj.is_single and isinstance(obj, GenerateReqInput):
+            if isinstance(request, fastapi.Request):
+                request.scope["perf_rid"] = obj.rid
+                request.scope["perf_room"] = obj.bootstrap_room
             perf_trace.emit(
                 "tm.recv",
                 rid=obj.rid,
@@ -2651,7 +2654,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.time_stats.first_token_time == 0.0:
                 first_output_time = time.perf_counter()
                 if perf_trace.ENABLED:
-                    perf_trace.emit("tm.first_out", rid=rid, finished=state.finished)
+                    first_text = (out_dict or {}).get("text")
+                    perf_trace.emit(
+                        "tm.first_out",
+                        rid=rid,
+                        finished=state.finished,
+                        completion_tokens=meta_info.get("completion_tokens"),
+                        text_len=len(first_text) if isinstance(first_text, str) else None,
+                    )
                 state.time_stats.set_first_token_time(
                     ts=self._get_scheduler_first_token_time(state, recv_obj, i)
                     or first_output_time

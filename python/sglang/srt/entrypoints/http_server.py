@@ -508,6 +508,37 @@ if perf_trace.ENABLED:
                     return
                 scope["perf_t0"] = time.time()
                 scope["perf_mono_ns"] = time.monotonic_ns()
+                if scope["path"] == "/generate" and scope["method"] in ("POST", "PUT"):
+                    first_body = True
+                    status = None
+
+                    async def traced_send(message):
+                        nonlocal first_body, status
+                        if message["type"] == "http.response.start":
+                            status = message["status"]
+                        elif message["type"] == "http.response.body":
+                            if first_body and message.get("body"):
+                                first_body = False
+                                perf_trace.emit(
+                                    "http.first_body",
+                                    rid=scope.get("perf_rid"),
+                                    room=scope.get("perf_room"),
+                                    status=status,
+                                    bytes=len(message["body"]),
+                                )
+                        await send(message)
+                        if message["type"] == "http.response.body" and not message.get(
+                            "more_body", False
+                        ):
+                            perf_trace.emit(
+                                "http.body_done",
+                                rid=scope.get("perf_rid"),
+                                room=scope.get("perf_room"),
+                                status=status,
+                            )
+
+                    await self.app(scope, receive, traced_send)
+                    return
             await self.app(scope, receive, send)
 
     app.add_middleware(_PerfArrivalMiddleware)
@@ -939,10 +970,22 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            first_visible_text = True
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
+                    if perf_trace.ENABLED and first_visible_text and out.get("text"):
+                        first_visible_text = False
+                        perf_trace.emit(
+                            "http.first_text",
+                            rid=out.get("meta_info", {}).get("id"),
+                            room=obj.bootstrap_room,
+                            completion_tokens=out.get("meta_info", {}).get(
+                                "completion_tokens"
+                            ),
+                            text_len=len(out["text"]),
+                        )
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side

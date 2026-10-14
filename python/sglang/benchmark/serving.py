@@ -117,6 +117,7 @@ class RequestFuncOutput:
     first_token_wall: float = 0.0
     start_mono_ns: int = 0
     first_token_mono_ns: int = 0
+    first_token_completion_tokens: int = 0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -796,6 +797,7 @@ async def async_request_sglang_generate(
                                         output.first_token_wall = time.time()
                                         output.first_token_mono_ns = time.monotonic_ns()
                                         output.rid = str(data["meta_info"].get("id", ""))
+                                        output.first_token_completion_tokens = output_len
 
                                 # Decoding phase
                                 else:
@@ -1958,6 +1960,9 @@ async def benchmark(
             first_token_walls=[output.first_token_wall for output in outputs],
             start_mono_ns=[output.start_mono_ns for output in outputs],
             first_token_mono_ns=[output.first_token_mono_ns for output in outputs],
+            first_token_completion_tokens=[
+                output.first_token_completion_tokens for output in outputs
+            ],
         )
 
     if args.cache_report:
