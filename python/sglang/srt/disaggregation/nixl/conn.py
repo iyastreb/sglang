@@ -1791,6 +1791,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
             if perf_trace.ENABLED:
+                post_done = time.perf_counter()
                 perf_trace.emit(
                     "xfer.posted",
                     notif=notif,
@@ -1799,7 +1800,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     descriptor_scope="prepared_input_indices",
                     **perf_trace.lengths_summary(item_lens, len(prefill_data_indices)),
                     make_ms=(post_start - make_start) * 1e3,
-                    post_ms=(time.perf_counter() - post_start) * 1e3,
+                    post_ms=(post_done - post_start) * 1e3,
                     src_runs=perf_trace.runs(prefill_data_indices),
                     dst_runs=perf_trace.runs(dst_data_indices),
                 )
