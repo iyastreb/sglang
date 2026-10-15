@@ -72,6 +72,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import nixl_posting_trace as posting_trace
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -766,6 +767,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
             )
+            if posting_trace.ENABLED:
+                posting_trace.emit(
+                    "request", role="decode", rank=self.tp_rank,
+                    rid=req.rid, room=req.bootstrap_room,
+                )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req):

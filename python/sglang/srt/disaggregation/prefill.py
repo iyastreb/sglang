@@ -82,6 +82,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability import nixl_posting_trace as posting_trace
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -389,6 +390,11 @@ class PrefillBootstrapQueue:
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
         self._process_req(req)
+        if posting_trace.ENABLED:
+            posting_trace.emit(
+                "request", role="prefill", rank=self.tp_rank,
+                rid=req.rid, room=req.bootstrap_room,
+            )
         req.pending_bootstrap = True
         return True
 

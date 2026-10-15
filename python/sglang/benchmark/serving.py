@@ -61,6 +61,8 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
 
 global args
 
+_POSTING_TRACE_ENABLED = bool(os.environ.get("SGLANG_NIXL_POSTING_TRACE_DIR"))
+
 
 # don't want to import sglang package here
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
@@ -108,6 +110,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    rid: str = ""
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -754,6 +757,8 @@ async def async_request_sglang_generate(
                             data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
+                            if _POSTING_TRACE_ENABLED and not output.rid:
+                                output.rid = str(_meta_info.get("id") or "")
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -1934,6 +1939,8 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if _POSTING_TRACE_ENABLED:
+        result_details["rids"] = [output.rid for output in outputs]
 
     if args.cache_report:
         result_details["cached_tokens"] = [o.cached_tokens for o in outputs]

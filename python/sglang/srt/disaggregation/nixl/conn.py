@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import nixl_posting_trace as posting_trace
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -1231,6 +1232,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             handles: List[Any] = []
             settle_timed_out = False
             room_transfer_infos = None
+            trace_error = ""
+            if posting_trace.ENABLED:
+                posting_trace.begin_chunk(
+                    rank=self.transfer_source_rank, room=room,
+                    chunk=kv_chunk.chunk_id, last=kv_chunk.is_last_chunk,
+                    worker=worker_index, pages=len(kv_chunk.prefill_kv_indices),
+                )
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1500,7 +1508,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
+                if posting_trace.ENABLED:
+                    wait_start = time.monotonic_ns()
                 settled, any_failed = self._await_handles(handles, failure_seen=False)
+                if posting_trace.ENABLED:
+                    wait_end = time.monotonic_ns()
+                    posting_trace.wait(wait_start, wait_end, settled, any_failed, False)
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
@@ -1548,6 +1561,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
+                if posting_trace.ENABLED:
+                    trace_error = type(e).__name__
                 if isinstance(e, _NIXL_TRANSPORT_ERRORS):
                     logger.warning(f"NIXL transport error for room {room}: {e}")
                 else:
@@ -1560,7 +1575,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # rather than only after the barrier.
                 notify = False
                 if not settle_timed_out:
-                    notify, _ = self._await_handles(handles, failure_seen=True)
+                    if posting_trace.ENABLED:
+                        wait_start = time.monotonic_ns()
+                    notify, wait_failed = self._await_handles(handles, failure_seen=True)
+                    if posting_trace.ENABLED:
+                        wait_end = time.monotonic_ns()
+                        posting_trace.wait(wait_start, wait_end, notify, wait_failed, True)
                 if notify:
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
                     # Every handle settled => the writes are done, but the
@@ -1584,6 +1604,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
                 # room_transfer_infos survives the sender's clear() of this room.
                 self._reload_invalidated_peers(room_transfer_infos or {})
+            finally:
+                if posting_trace.ENABLED:
+                    posting_trace.finish_chunk(trace_error, len(handles))
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1738,12 +1761,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 else self._num_slots_src
             )
             num_layers = len(item_lens)
+            if posting_trace.ENABLED:
+                prep_start = time.monotonic_ns()
             src_indices = repeat_indices_over_layers(
                 prefill_data_indices, num_layers, self._num_slots_src
             )
             dst_indices = repeat_indices_over_layers(
                 dst_data_indices, num_layers, num_slots_dst
             )
+            if posting_trace.ENABLED:
+                prep_end = time.monotonic_ns()
+                make_start = time.monotonic_ns()
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
                 src_prep,
@@ -1752,11 +1780,26 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_indices,
                 notif.encode("ascii"),
             )
+            if posting_trace.ENABLED:
+                make_end = time.monotonic_ns()
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
+            if posting_trace.ENABLED:
+                post_start = time.monotonic_ns()
             state = self.agent.transfer(xfer_handle)
+            if posting_trace.ENABLED:
+                post_end = time.monotonic_ns()
             if state == "ERR":
                 raise Exception("KVSender failed to post prepped transfer")
+            if posting_trace.ENABLED:
+                posting_trace.transfer(
+                    kind="kv_prepared", peer=peer_name, notif=notif,
+                    input_indices=len(src_indices),
+                    prep_start_ns=prep_start, prep_end_ns=prep_end,
+                    desc_start_ns=None, desc_end_ns=None,
+                    make_start_ns=make_start, make_end_ns=make_end,
+                    post_start_ns=post_start, post_end_ns=post_end, state=state,
+                )
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -1764,6 +1807,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
         # 0xffff81ab54e01000). Casting here prevents overflow when these values
         # are later used in numpy arithmetic.
+        if posting_trace.ENABLED:
+            prep_start = time.monotonic_ns()
         src_data_ptrs = np.array(src_data_ptrs, dtype=np.uint64)
         dst_data_ptrs = np.array(dst_data_ptrs, dtype=np.uint64)
         item_lens = np.array(item_lens, dtype=np.uint64)
@@ -1879,9 +1924,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_data_indices)}, after group: {len(src_addrs)}"
         )
+        if posting_trace.ENABLED:
+            prep_end = time.monotonic_ns()
+            desc_start = time.monotonic_ns()
         src_descs = self.agent.get_xfer_descs(src_reqs, src_mem_kind)
         dst_descs = self.agent.get_xfer_descs(dst_reqs, dst_mem_kind)
+        if posting_trace.ENABLED:
+            desc_end = time.monotonic_ns()
         # Transfer data
+        if posting_trace.ENABLED:
+            make_start = time.monotonic_ns()
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
             src_descs,
@@ -1889,11 +1941,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             peer_name,
             notif.encode("ascii"),  # type: ignore
         )
+        if posting_trace.ENABLED:
+            make_end = time.monotonic_ns()
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
+        if posting_trace.ENABLED:
+            post_start = time.monotonic_ns()
         state = self.agent.transfer(xfer_handle)
+        if posting_trace.ENABLED:
+            post_end = time.monotonic_ns()
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
+        if posting_trace.ENABLED:
+            posting_trace.transfer(
+                kind="state_generic" if state_type is not None else "kv_generic",
+                peer=peer_name, notif=notif, state_type=str(state_type),
+                input_indices=len(prefill_data_indices), input_descriptors=len(src_reqs),
+                prep_start_ns=prep_start, prep_end_ns=prep_end,
+                desc_start_ns=desc_start, desc_end_ns=desc_end,
+                make_start_ns=make_start, make_end_ns=make_end,
+                post_start_ns=post_start, post_end_ns=post_end, state=state,
+            )
         return xfer_handle
 
     def send_kvcache(
@@ -2052,6 +2120,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         handles = []
         for part_idx, seg in enumerate(segments):
             num_layers = seg.end - seg.start
+            if posting_trace.ENABLED:
+                prep_start = time.monotonic_ns()
             src_indices = repeat_indices_over_layers(
                 prefill_kv_indices, num_layers, self._num_slots_src
             )
@@ -2059,6 +2129,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_kv_indices, num_layers, seg.dst_num_slots
             )
             part_notif = f"{notif}_part_{part_idx}_{num_parts}"
+            if posting_trace.ENABLED:
+                prep_end = time.monotonic_ns()
+                make_start = time.monotonic_ns()
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE",
                 seg.src_handle,
@@ -2067,11 +2140,26 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_indices,
                 part_notif.encode("ascii"),
             )
+            if posting_trace.ENABLED:
+                make_end = time.monotonic_ns()
             if not xfer_handle:
                 raise Exception("KVSender failed to create mixed prepped transfer")
+            if posting_trace.ENABLED:
+                post_start = time.monotonic_ns()
             state = self.agent.transfer(xfer_handle)
+            if posting_trace.ENABLED:
+                post_end = time.monotonic_ns()
             if state == "ERR":
                 raise Exception("KVSender failed to post mixed prepped transfer")
+            if posting_trace.ENABLED:
+                posting_trace.transfer(
+                    kind="kv_prepared", peer=peer_name, notif=part_notif,
+                    segment=part_idx, segments=num_parts, input_indices=len(src_indices),
+                    prep_start_ns=prep_start, prep_end_ns=prep_end,
+                    desc_start_ns=None, desc_end_ns=None,
+                    make_start_ns=make_start, make_end_ns=make_end,
+                    post_start_ns=post_start, post_end_ns=post_end, state=state,
+                )
             handles.append(xfer_handle)
         return handles
 
@@ -2338,6 +2426,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_aux_index: int,
         notif: str,
     ):
+        if posting_trace.ENABLED:
+            prep_start = time.monotonic_ns()
         src_addrs = []
         dst_addrs = []
 
@@ -2351,9 +2441,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_addrs.append((src_addr, length, 0))
             dst_addrs.append((dst_addr, length, 0))
 
+        if posting_trace.ENABLED:
+            prep_end = time.monotonic_ns()
+            desc_start = time.monotonic_ns()
         src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+        if posting_trace.ENABLED:
+            desc_end = time.monotonic_ns()
         # Transfer data
+        if posting_trace.ENABLED:
+            make_start = time.monotonic_ns()
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
             src_descs,
@@ -2361,11 +2458,26 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             peer_name,
             notif.encode("ascii"),  # type: ignore
         )
+        if posting_trace.ENABLED:
+            make_end = time.monotonic_ns()
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
+        if posting_trace.ENABLED:
+            post_start = time.monotonic_ns()
         state = self.agent.transfer(xfer_handle)
+        if posting_trace.ENABLED:
+            post_end = time.monotonic_ns()
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
+        if posting_trace.ENABLED:
+            posting_trace.transfer(
+                kind="aux", peer=peer_name, notif=notif,
+                input_descriptors=len(src_addrs),
+                prep_start_ns=prep_start, prep_end_ns=prep_end,
+                desc_start_ns=desc_start, desc_end_ns=desc_end,
+                make_start_ns=make_start, make_end_ns=make_end,
+                post_start_ns=post_start, post_end_ns=post_end, state=state,
+            )
         return xfer_handle
 
     def _send_slot_state(
@@ -2380,6 +2492,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_gpu_id: int,
         notif: str,
     ):
+        if posting_trace.ENABLED:
+            prep_start = time.monotonic_ns()
         dst_data_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
             src_data_ptrs,
             dst_data_ptrs,
@@ -2410,16 +2524,37 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_addrs = [
             (dst_addr, length, dst_gpu_id) for _, dst_addr, length in transfer_blocks
         ]
+        if posting_trace.ENABLED:
+            prep_end = time.monotonic_ns()
+            desc_start = time.monotonic_ns()
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+        if posting_trace.ENABLED:
+            desc_end = time.monotonic_ns()
+            make_start = time.monotonic_ns()
         xfer_handle = self.agent.initialize_xfer(
             "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
         )
+        if posting_trace.ENABLED:
+            make_end = time.monotonic_ns()
         if not xfer_handle:
             raise Exception("KVSender failed to create dsa_tail transfer")
+        if posting_trace.ENABLED:
+            post_start = time.monotonic_ns()
         state = self.agent.transfer(xfer_handle)
+        if posting_trace.ENABLED:
+            post_end = time.monotonic_ns()
         if state == "ERR":
             raise Exception("KVSender failed to post dsa_tail transfer")
+        if posting_trace.ENABLED:
+            posting_trace.transfer(
+                kind="state_slot", peer=peer_name, notif=notif,
+                input_indices=len(src_indices), input_descriptors=len(src_addrs),
+                prep_start_ns=prep_start, prep_end_ns=prep_end,
+                desc_start_ns=desc_start, desc_end_ns=desc_end,
+                make_start_ns=make_start, make_end_ns=make_end,
+                post_start_ns=post_start, post_end_ns=post_end, state=state,
+            )
         return xfer_handle
 
     def _send_mamba_state(
