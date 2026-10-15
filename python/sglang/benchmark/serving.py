@@ -75,6 +75,7 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
 
 _PERF_TRACE_ENABLED = _get_bool_env_var("SGLANG_PERF_TRACE")
 _DFW_PROFILE_CONTROL = os.getenv("SGLANG_DFW_PROFILE_CONTROL", "")
+_DFW_BENCH_WINDOW = _get_bool_env_var("SGLANG_DFW_BENCH_WINDOW")
 _CLIENT_GC_PAUSES = deque(maxlen=4096)
 _CLIENT_GC_STARTS = {}
 _CLIENT_GC_DROPPED = 0
@@ -1702,6 +1703,8 @@ async def benchmark(
 
     # Run all requests
     client_gc_before_measured = _client_gc_state() if _PERF_TRACE_ENABLED else None
+    if _DFW_BENCH_WINDOW:
+        benchmark_window_start_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
@@ -1771,6 +1774,8 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    if _DFW_BENCH_WINDOW:
+        benchmark_window_end_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -2067,6 +2072,15 @@ async def benchmark(
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
+
+    if _DFW_BENCH_WINDOW:
+        result["benchmark_window"] = dict(
+            clock="CLOCK_MONOTONIC",
+            host=socket.gethostname(),
+            pid=os.getpid(),
+            start_mono_ns=benchmark_window_start_ns,
+            end_mono_ns=benchmark_window_end_ns,
+        )
 
     # Determine output file name
     if args.output_file:
