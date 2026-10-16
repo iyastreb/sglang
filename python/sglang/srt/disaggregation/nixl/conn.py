@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import nixl_state_trace as state_trace
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -491,6 +492,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        if disaggregation_mode == DisaggregationMode.PREFILL:
+            state_trace.install(self.agent, self.kv_args.engine_rank)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
             # nixl_agent_config to explicitly-created backends.
@@ -2694,6 +2697,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("Failed to post SWA state slice transfer")
         return xfer_handle
 
+    @state_trace.measure
     def maybe_send_extra(
         self,
         peer_name: str,
