@@ -26,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     CachedTokensDetails,
     wrap_as_pickle,
 )
+from sglang.srt.observability import perf_trace
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
@@ -238,6 +239,8 @@ class SchedulerOutputStreamer:
         return False
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
+        if req.finished() and perf_trace.ENABLED and get_parallel().attn_tp_rank == 0:
+            perf_trace.emit_req(req)
         if (
             req.finished()
             and get_parallel().attn_tp_rank == 0

@@ -696,6 +696,10 @@ class Envs:
     # Force the WAR barrier to wait for the whole forward instead of the
     # read-done fastpath event.
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
+    # Per-request PD timeline probes (observability/perf_trace.py); JSONL under
+    # SGLANG_PERF_TRACE_DIR, else $LOG_DIR/profile.
+    SGLANG_PERF_TRACE = EnvBool(False)
+    SGLANG_PERF_TRACE_DIR = EnvStr(None)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,

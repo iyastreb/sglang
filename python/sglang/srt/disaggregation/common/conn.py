@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.runtime_context import (
     get_device,
@@ -924,6 +925,8 @@ class CommonKVManager(BaseKVManager):
                 bootstrap_room
             )
             completed_ranks.add(prefill_rank)
+            if len(completed_ranks) == expected_response_num:
+                perf_trace.emit("dc.status", room=bootstrap_room, done=len(completed_ranks))
             if expected_response_num is None:
                 logger.warning(
                     "No expected prefill response count for room %s, prefill rank %s",

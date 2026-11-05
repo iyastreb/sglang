@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -1697,6 +1698,7 @@ class SchedulerDisaggregationPrefillMixin:
                     raw_kv_indices
                 )
             )
+            t_chunk0 = time.time()
             sender = req.disagg_kv_sender
             indices_event = None
             if getattr(sender, "supports_host_tensor_indices", False) and not (
@@ -1717,6 +1719,7 @@ class SchedulerDisaggregationPrefillMixin:
                 indices_event.record(torch.cuda.current_stream())
             else:
                 page_indices = kv_to_page_indices(kv_indices, page_size)
+            t_chunk1 = time.time()
             segment_is_last = last_chunk and is_final_segment
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
@@ -1734,6 +1737,16 @@ class SchedulerDisaggregationPrefillMixin:
                     send_state_indices,
                     num_kv_tokens=seg_end - seg_start,
                 )
+            perf_trace.emit(
+                "pf.send",
+                rid=req.rid,
+                room=req.bootstrap_room,
+                pages=len(page_indices),
+                last=segment_is_last,
+                host_event=indices_event is not None,
+                idx_ms=(t_chunk1 - t_chunk0) * 1000,
+                send_ms=(time.time() - t_chunk1) * 1000,
+            )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.

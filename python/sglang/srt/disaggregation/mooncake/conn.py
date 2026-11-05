@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.mooncake_trace import (
     MooncakeRequestStage,
     mooncake_trace_func,
@@ -2477,6 +2478,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             kv_chunk: Optional[TransferKVChunk] = None
             try:
                 kv_chunk = queue.get()
+                t_deq = time.time()
                 # teardown() pushes a None sentinel to unblock get() and stop
                 # the worker: FastQueue.get() blocks indefinitely, so checking
                 # _stopped alone can never wake a parked worker during a role switch.
@@ -2514,6 +2516,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.indices_event = None
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
+                t_ready = time.time()
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -2812,6 +2815,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         thread_finish_flag=True,
                     )
 
+                perf_trace.emit(
+                    "w.chunk",
+                    room=kv_chunk.room,
+                    last=kv_chunk.is_last_chunk,
+                    pages=len(kv_chunk.prefill_kv_indices),
+                    worker=worker_index,
+                    t_deq=t_deq,
+                    t_ready=t_ready,
+                    t_done=time.time(),
+                )
                 if staging_deferred:
                     continue
 

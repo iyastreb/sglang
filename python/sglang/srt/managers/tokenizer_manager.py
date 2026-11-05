@@ -132,6 +132,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -2753,6 +2754,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     or first_output_time
                 )
                 state.time_stats.set_last_time(ts=first_output_time)
+                perf_trace.emit("tm.first_out", rid=recv_obj.rids[i], finished=state.finished)
 
             if state.finished:
                 span_attrs = (
@@ -3858,6 +3860,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            if perf_trace.ENABLED:
+                perf_trace.set_role(f"tokenizer-{getattr(self.disaggregation_mode, 'value', self.disaggregation_mode)}")
+                perf_trace.emit("tm.recv", rid=rid, room=bootstrap_room)
             new_states[rid] = state
 
         self.rid_to_state.update(new_states)
