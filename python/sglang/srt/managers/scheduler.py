@@ -308,6 +308,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability import perf_trace
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -1518,6 +1519,7 @@ class Scheduler(
         self.disagg_decode_transfer_queue = None
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
+        perf_trace.set_role(f"sched-{self.disaggregation_mode.value}", get_parallel().attn_tp_rank)
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )

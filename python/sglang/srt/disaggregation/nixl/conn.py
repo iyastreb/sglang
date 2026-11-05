@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability import perf_trace
 from sglang.srt.runtime_context import get_device, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -1607,6 +1608,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
+            t_deq = time.time()
             room = kv_chunk.room
             handles: List[Any] = []
             settle_timed_out = False
@@ -1642,6 +1644,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.indices_event = None
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
+                t_ready = time.time()
 
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
@@ -1888,7 +1891,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
+                t_posted = time.time()
                 settled, any_failed = self._await_handles(handles, failure_seen=False)
+                t_done = time.time()
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
@@ -1912,6 +1917,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._maybe_ack_drained_abort(room)
                 if kv_chunk.is_last_chunk:
                     self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
+                perf_trace.emit(
+                    "w.chunk",
+                    room=room,
+                    last=kv_chunk.is_last_chunk,
+                    pages=len(kv_chunk.prefill_kv_indices),
+                    worker=worker_index,
+                    handles=len(handles),
+                    t_deq=t_deq,
+                    t_ready=t_ready,
+                    t_posted=t_posted,
+                    t_done=t_done,
+                    t_concluded=time.time(),
+                )
 
                 # Drop per-room state only when no chunk is still outstanding and
                 # the room has concluded: Success, or a Failed *last* chunk. A
