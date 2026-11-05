@@ -1631,6 +1631,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
 
+                # Early-send and asynchronous host-index copies complete on the
+                # worker, not the scheduler thread (supports_host_tensor_indices).
+                if kv_chunk.wait_event is not None:
+                    if self.check_status(room) != KVPoll.Failed:
+                        kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
+                if kv_chunk.indices_event is not None:
+                    kv_chunk.indices_event.synchronize()
+                    kv_chunk.indices_event = None
+                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
+                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
+
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
@@ -3301,6 +3313,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
+                indices_event=indices_event,
             )
         )
         return None
@@ -3527,7 +3541,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
 
 class NixlKVSender(CommonKVSender):
-    pass
+    # The scheduler hands over pinned host page indices with a CUDA event; the
+    # transfer worker waits on it (see transfer_worker), so the scheduler thread
+    # no longer blocks on the schedule stream behind the in-flight forward.
+    supports_host_tensor_indices = True
 
 
 class NixlKVReceiver(CommonKVReceiver):
