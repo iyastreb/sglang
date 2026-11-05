@@ -182,6 +182,8 @@ class _NixlPostError(RuntimeError):
 # This worker serves other rooms, so bound that wait.
 NIXL_ERR_SETTLE_TIMEOUT_S = 5.0
 NIXL_ERR_SETTLE_POLL_S = 0.001
+NIXL_POLL_INTERVAL_S = envs.SGLANG_NIXL_POLL_INTERVAL_US.get() / 1_000_000
+
 
 
 def _resolve_ucx_device_list(ib_device: str, gpu_id: int) -> Optional[str]:
@@ -1122,7 +1124,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if all_settled:
                 return True, any_failed
             if not any_failed:
-                time.sleep(0)
+                time.sleep(NIXL_POLL_INTERVAL_S)
                 continue
             # This room is already lost, so trade its notification for the
             # worker's other rooms: back off, and give up waiting for the
@@ -3558,7 +3560,7 @@ class NixlKVSender(CommonKVSender):
     # The scheduler hands over pinned host page indices with a CUDA event; the
     # transfer worker waits on it (see transfer_worker), so the scheduler thread
     # no longer blocks on the schedule stream behind the in-flight forward.
-    supports_host_tensor_indices = True
+    supports_host_tensor_indices = envs.SGLANG_NIXL_HOST_INDICES.get()
 
 
 class NixlKVReceiver(CommonKVReceiver):

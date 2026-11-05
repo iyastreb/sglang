@@ -700,6 +700,11 @@ class Envs:
     # SGLANG_PERF_TRACE_DIR, else $LOG_DIR/profile.
     SGLANG_PERF_TRACE = EnvBool(False)
     SGLANG_PERF_TRACE_DIR = EnvStr(None)
+    # NIXL PD sender takes pinned host page indices with a CUDA event (like Mooncake);
+    # 0 restores the blocking device-to-host copy on the scheduler thread.
+    SGLANG_NIXL_HOST_INDICES = EnvBool(True)
+    # Sleep between NIXL transfer-completion polls in the worker; 0 only yields.
+    SGLANG_NIXL_POLL_INTERVAL_US = EnvInt(0)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
